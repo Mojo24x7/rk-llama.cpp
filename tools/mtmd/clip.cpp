@@ -1051,6 +1051,11 @@ struct clip_model_loader {
                                     ? PROJECTOR_TYPE_QWEN25VL
                                     : PROJECTOR_TYPE_QWEN2A;
             }
+            if (model.proj_type == PROJECTOR_TYPE_GEMMA4UV) {
+                model.proj_type = modality == CLIP_MODALITY_VISION
+                                    ? PROJECTOR_TYPE_GEMMA4V
+                                    : PROJECTOR_TYPE_GEMMA4A;
+            }
         }
 
         const bool is_vision = model.modality == CLIP_MODALITY_VISION;

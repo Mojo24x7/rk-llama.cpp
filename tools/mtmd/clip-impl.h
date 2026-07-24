@@ -242,6 +242,7 @@ enum projector_type {
     PROJECTOR_TYPE_GEMMA3NA,
     PROJECTOR_TYPE_GEMMA4V,
     PROJECTOR_TYPE_GEMMA4A,
+    PROJECTOR_TYPE_GEMMA4UV, // unified vision+audio; remapped to GEMMA4V/GEMMA4A per modality
     PROJECTOR_TYPE_PHI4,
     PROJECTOR_TYPE_IDEFICS3,
     PROJECTOR_TYPE_PIXTRAL,
@@ -283,6 +284,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_GEMMA3NA,  "gemma3na"},
     { PROJECTOR_TYPE_GEMMA4V,   "gemma4v"},
     { PROJECTOR_TYPE_GEMMA4A,   "gemma4a"},
+    { PROJECTOR_TYPE_GEMMA4UV,  "gemma4uv"},
     { PROJECTOR_TYPE_PHI4,      "phi4"},
     { PROJECTOR_TYPE_IDEFICS3,  "idefics3"},
     { PROJECTOR_TYPE_PIXTRAL,   "pixtral"},
