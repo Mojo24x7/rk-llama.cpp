@@ -86,7 +86,7 @@ struct IOMMUDomainManager {
     // Function for assigning the domain for the tensor of given size
     int32_t assign_domain_memory(size_t size) {
         std::lock_guard<std::mutex> lock(mutex);
-        fprintf(stderr, "RKNPU-DBG assign size=%zu\n", size);
+        // [dbg-stripped] fprintf(stderr, "RKNPU-DBG assign size=%zu\n", size);
 
         // Allocate strictly within the allowed domains
         if (!allowed_domains.empty()) {
@@ -150,7 +150,7 @@ private:
             memset(&io_attr, 0, sizeof(io_attr));
             rknn_matmul_ctx ctx = 0;
             int _mmret = rknn_matmul_create(&ctx, &info, &io_attr);
-            fprintf(stderr, "RKNPU-DBG ensure_ctx domain=%d ret=%d ctx=%p\n", domain_id, _mmret, (void*)(uintptr_t)ctx);
+            // [dbg-stripped] fprintf(stderr, "RKNPU-DBG ensure_ctx domain=%d ret=%d ctx=%p\n", domain_id, _mmret, (void*)(uintptr_t)ctx);
             allocator_contexts[domain_id] = ctx;
         }
     }
@@ -288,7 +288,7 @@ struct ggml_backend_rknpu_buffer_context {
     // Function for the allocation of a RKNN buffer for the individual tensor
     TensorAllocation get_tensor_allocation(size_t tensor_offset, size_t size) {
         std::lock_guard<std::mutex> lock(mutex);
-        fprintf(stderr, "RKNPU-DBG getalloc off=%zu size=%zu\n", tensor_offset, size);
+        // [dbg-stripped] fprintf(stderr, "RKNPU-DBG getalloc off=%zu size=%zu\n", tensor_offset, size);
 
         // Trying to find an existing buffer
         auto it = tensor_allocs.find(tensor_offset);
@@ -433,11 +433,11 @@ static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         auto it = ctx->tensor_allocs.find(offset);
         if (it != ctx->tensor_allocs.end()) {
-            if (_grp_dbg < 60) { fprintf(stderr, "RKNPU-GRP name=%s type=%d NPU-PTR(allocs-hit) off=%zu\n", tensor->name, (int)tensor->type, offset); _grp_dbg++; }
+            // [dbg-stripped] if (_grp_dbg < 60) { fprintf(stderr, "RKNPU-GRP name=%s type=%d NPU-PTR(allocs-hit) off=%zu\n", tensor->name, (int)tensor->type, offset); _grp_dbg++; }
             return it->second.mem->virt_addr;
         }
     }
-    if (_grp_dbg < 60) { fprintf(stderr, "RKNPU-GRP name=%s type=%d data-ptr pipeline=%d\n", tensor->name, (int)tensor->type, pipeline?1:0); _grp_dbg++; }
+    // [dbg-stripped] if (_grp_dbg < 60) { fprintf(stderr, "RKNPU-GRP name=%s type=%d data-ptr pipeline=%d\n", tensor->name, (int)tensor->type, pipeline?1:0); _grp_dbg++; }
     return tensor->data;
 }
 
@@ -642,7 +642,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 if (!mem_A_shared) return GGML_STATUS_FAILED;
 
                 const float* x = (const float*)get_tensor_real_ptr(src1);
-                { static int _vdbg=0; if(_vdbg<10){ fprintf(stderr,"RKNPU-VAL src1=%s x0..3= %.4f %.4f %.4f %.4f\n", src1->name, (double)x[0],(double)x[1],(double)x[2],(double)x[3]); _vdbg++; } }
+                // [dbg-stripped] { static int _vdbg=0; if(_vdbg<10){ fprintf(stderr,"RKNPU-VAL src1=%s x0..3= %.4f %.4f %.4f %.4f\n", src1->name, (double)x[0],(double)x[1],(double)x[2],(double)x[3]); _vdbg++; } }
                 const int row_stride = (int)(src1->nb[1] / sizeof(float));
                 void* dst_base = mem_A_shared->virt_addr;
 
@@ -1071,7 +1071,7 @@ static size_t pack_tensor_segment(
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
-    fprintf(stderr, "RKNPU-DBG set_tensor name=%s type=%d ne0=%lld ne1=%lld off=%zu size=%zu\n", tensor->name, (int)tensor->type, (long long)tensor->ne[0], (long long)tensor->ne[1], offset, size);
+    // [dbg-stripped] fprintf(stderr, "RKNPU-DBG set_tensor name=%s type=%d ne0=%lld ne1=%lld off=%zu size=%zu\n", tensor->name, (int)tensor->type, (long long)tensor->ne[0], (long long)tensor->ne[1], offset, size);
 
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* pipeline = config.resolve_op_support(tensor);
@@ -1161,7 +1161,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
     } else {
         memcpy((uint8_t*)tensor->data + offset, data, size);
-        { static int _sd=0; if(_sd<12){ const float* fp=(const float*)data; fprintf(stderr,"RKNPU-SET plain name=%s type=%d off=%zu size=%zu d0..2= %.4f %.4f %.4f\n", tensor->name,(int)tensor->type,offset,size,(double)fp[0],(double)fp[1],(double)fp[2]); _sd++; } }
+        // [dbg-stripped] { static int _sd=0; if(_sd<12){ const float* fp=(const float*)data; fprintf(stderr,"RKNPU-SET plain name=%s type=%d off=%zu size=%zu d0..2= %.4f %.4f %.4f\n", tensor->name,(int)tensor->type,offset,size,(double)fp[0],(double)fp[1],(double)fp[2]); _sd++; } }
     }
 }
 
@@ -1173,10 +1173,10 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
     if (it != ctx->tensor_allocs.end()) {
         memcpy(data, (uint8_t*)it->second.mem->virt_addr + offset, size);
-        { static int _gt=0; if(_gt<12){ fprintf(stderr,"RKNPU-GET dma name=%s off=%zu size=%zu\n", tensor->name,offset,size); _gt++; } }
+        // [dbg-stripped] { static int _gt=0; if(_gt<12){ fprintf(stderr,"RKNPU-GET dma name=%s off=%zu size=%zu\n", tensor->name,offset,size); _gt++; } }
     } else {
         memcpy(data, (uint8_t*)tensor->data + offset, size);
-        { static int _gt2=0; if(_gt2<12){ const float* fp=(const float*)((uint8_t*)tensor->data+offset); fprintf(stderr,"RKNPU-GET plain name=%s off=%zu size=%zu d0..2= %.4f %.4f %.4f\n", tensor->name,offset,size,(double)fp[0],(double)fp[1],(double)fp[2]); _gt2++; } }
+        // [dbg-stripped] { static int _gt2=0; if(_gt2<12){ const float* fp=(const float*)((uint8_t*)tensor->data+offset); fprintf(stderr,"RKNPU-GET plain name=%s off=%zu size=%zu d0..2= %.4f %.4f %.4f\n", tensor->name,offset,size,(double)fp[0],(double)fp[1],(double)fp[2]); _gt2++; } }
     }
 }
 
