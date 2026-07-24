@@ -1980,9 +1980,19 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    // RK-LLAMA fix: the RPC peer is always a remote RKNPU device. Delegate to the
+    // coordinator local RKNPU device supports_op (identical hardware + checks) so
+    // ONLY ops the remote NPU can run (MUL_MAT w/ matching align/type) are offloaded;
+    // get_rows/norm/rope/softmax/SET_ROWS etc. stay on the coordinator CPU.
+    static ggml_backend_dev_t rknpu_dev = []() -> ggml_backend_dev_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RKNPU");
+        if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) return nullptr;
+        return ggml_backend_reg_dev_get(reg, 0);
+    }();
+    if (rknpu_dev != nullptr) {
+        return ggml_backend_dev_supports_op(rknpu_dev, op);
+    }
+    return op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_NONE;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

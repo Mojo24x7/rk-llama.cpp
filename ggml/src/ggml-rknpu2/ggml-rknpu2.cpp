@@ -14,6 +14,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -85,6 +86,7 @@ struct IOMMUDomainManager {
     // Function for assigning the domain for the tensor of given size
     int32_t assign_domain_memory(size_t size) {
         std::lock_guard<std::mutex> lock(mutex);
+        fprintf(stderr, "RKNPU-DBG assign size=%zu\n", size);
 
         // Allocate strictly within the allowed domains
         if (!allowed_domains.empty()) {
@@ -145,8 +147,10 @@ private:
             info.iommu_domain_id = domain_id;
 
             rknn_matmul_io_attr io_attr;
+            memset(&io_attr, 0, sizeof(io_attr));
             rknn_matmul_ctx ctx = 0;
-            rknn_matmul_create(&ctx, &info, &io_attr);
+            int _mmret = rknn_matmul_create(&ctx, &info, &io_attr);
+            fprintf(stderr, "RKNPU-DBG ensure_ctx domain=%d ret=%d ctx=%p\n", domain_id, _mmret, (void*)(uintptr_t)ctx);
             allocator_contexts[domain_id] = ctx;
         }
     }
@@ -274,16 +278,17 @@ struct ggml_backend_rknpu_buffer_context {
     std::unordered_map<size_t, TensorAllocation> tensor_allocs;
 
     // Per-block scaling factors for quantized weights
-    std::unordered_map<const struct ggml_tensor *, std::vector<float>> quantized_tensor_scales;
+    std::unordered_map<size_t, std::vector<float>> quantized_tensor_scales;
 
     // Per-tensor random sign vector for Hadamard Transform
-    std::unordered_map<const struct ggml_tensor *, std::vector<float>> hadamard_s_vectors;
+    std::unordered_map<size_t, std::vector<float>> hadamard_s_vectors;
 
     std::mutex mutex;
 
     // Function for the allocation of a RKNN buffer for the individual tensor
     TensorAllocation get_tensor_allocation(size_t tensor_offset, size_t size) {
         std::lock_guard<std::mutex> lock(mutex);
+        fprintf(stderr, "RKNPU-DBG getalloc off=%zu size=%zu\n", tensor_offset, size);
 
         // Trying to find an existing buffer
         auto it = tensor_allocs.find(tensor_offset);
@@ -414,6 +419,7 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
 }
 
 // Function for acquiring a pointer for tensor data
+static int _grp_dbg = 0;
 static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
     if (!tensor || !tensor->data) return nullptr;
 
@@ -427,10 +433,11 @@ static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         auto it = ctx->tensor_allocs.find(offset);
         if (it != ctx->tensor_allocs.end()) {
+            if (_grp_dbg < 60) { fprintf(stderr, "RKNPU-GRP name=%s type=%d NPU-PTR(allocs-hit) off=%zu\n", tensor->name, (int)tensor->type, offset); _grp_dbg++; }
             return it->second.mem->virt_addr;
         }
     }
-
+    if (_grp_dbg < 60) { fprintf(stderr, "RKNPU-GRP name=%s type=%d data-ptr pipeline=%d\n", tensor->name, (int)tensor->type, pipeline?1:0); _grp_dbg++; }
     return tensor->data;
 }
 
@@ -551,7 +558,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         std::vector<float> s_vec;
         if (is_hadamard) {
             std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
-            auto it = src0_buf_ctx->hadamard_s_vectors.find(src0);
+            auto it = src0_buf_ctx->hadamard_s_vectors.find(tensor_offset_in_virtual);
             GGML_ASSERT(it != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
             s_vec = it->second;
         }
@@ -560,7 +567,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         std::vector<float> scales_B_grid;
         if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) {
             std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
-            auto it = src0_buf_ctx->quantized_tensor_scales.find(src0);
+            auto it = src0_buf_ctx->quantized_tensor_scales.find(tensor_offset_in_virtual);
             GGML_ASSERT(it != src0_buf_ctx->quantized_tensor_scales.end() && "Quantized scales grid not found");
             scales_B_grid = it->second;
         }
@@ -635,6 +642,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 if (!mem_A_shared) return GGML_STATUS_FAILED;
 
                 const float* x = (const float*)get_tensor_real_ptr(src1);
+                { static int _vdbg=0; if(_vdbg<10){ fprintf(stderr,"RKNPU-VAL src1=%s x0..3= %.4f %.4f %.4f %.4f\n", src1->name, (double)x[0],(double)x[1],(double)x[2],(double)x[3]); _vdbg++; } }
                 const int row_stride = (int)(src1->nb[1] / sizeof(float));
                 void* dst_base = mem_A_shared->virt_addr;
 
@@ -924,7 +932,7 @@ static void dequantize_tensor_segment(
     std::vector<float> s_vec;
     if (use_hadamard) {
         std::lock_guard<std::mutex> lock(ctx->mutex);
-        s_vec = ctx->hadamard_s_vectors[tensor];
+        s_vec = ctx->hadamard_s_vectors[(size_t)((uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base)];
     }
 
     #pragma omp parallel for
@@ -1063,6 +1071,7 @@ static size_t pack_tensor_segment(
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
+    fprintf(stderr, "RKNPU-DBG set_tensor name=%s type=%d ne0=%lld ne1=%lld off=%zu size=%zu\n", tensor->name, (int)tensor->type, (long long)tensor->ne[0], (long long)tensor->ne[1], offset, size);
 
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* pipeline = config.resolve_op_support(tensor);
@@ -1085,7 +1094,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             }
 
             std::lock_guard<std::mutex> lock(ctx->mutex);
-            ctx->hadamard_s_vectors[tensor] = s_vec;
+            ctx->hadamard_s_vectors[tensor_offset_in_virtual] = s_vec;
         }
 
         // Computing global scale
@@ -1145,13 +1154,14 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         {
             std::lock_guard<std::mutex> lock(ctx->mutex);
-            ctx->quantized_tensor_scales[tensor] = tensor_block_scales;
+            ctx->quantized_tensor_scales[tensor_offset_in_virtual] = tensor_block_scales;
         }
 
         rknn_matmul_ctx sync_ctx = g_domain_manager.get_allocator_context(alloc.iommu_domain_id);
         RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
     } else {
         memcpy((uint8_t*)tensor->data + offset, data, size);
+        { static int _sd=0; if(_sd<12){ const float* fp=(const float*)data; fprintf(stderr,"RKNPU-SET plain name=%s type=%d off=%zu size=%zu d0..2= %.4f %.4f %.4f\n", tensor->name,(int)tensor->type,offset,size,(double)fp[0],(double)fp[1],(double)fp[2]); _sd++; } }
     }
 }
 
@@ -1163,8 +1173,10 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
     if (it != ctx->tensor_allocs.end()) {
         memcpy(data, (uint8_t*)it->second.mem->virt_addr + offset, size);
+        { static int _gt=0; if(_gt<12){ fprintf(stderr,"RKNPU-GET dma name=%s off=%zu size=%zu\n", tensor->name,offset,size); _gt++; } }
     } else {
         memcpy(data, (uint8_t*)tensor->data + offset, size);
+        { static int _gt2=0; if(_gt2<12){ const float* fp=(const float*)((uint8_t*)tensor->data+offset); fprintf(stderr,"RKNPU-GET plain name=%s off=%zu size=%zu d0..2= %.4f %.4f %.4f\n", tensor->name,offset,size,(double)fp[0],(double)fp[1],(double)fp[2]); _gt2++; } }
     }
 }
 
@@ -1244,13 +1256,32 @@ static const char * ggml_backend_rknpu_device_get_description(ggml_backend_dev_t
 
 static void ggml_backend_rknpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     UNUSED(dev);
-    *free = 0;
-    *total = 0;
+    // RK-LLAMA fix: RKNPU weights are drawn from system RAM via IOMMU domains, so
+    // report real host memory. This lets -sm layer split weights across multiple
+    // RKNPU devices (local + RPC) proportionally instead of dumping all on one.
+    size_t mem_free = 0, mem_total = 0;
+    FILE* mf = fopen("/proc/meminfo", "r");
+    if (mf) {
+        char line[256];
+        while (fgets(line, sizeof(line), mf)) {
+            unsigned long kb = 0;
+            if (sscanf(line, "MemAvailable: %lu kB", &kb) == 1) mem_free = (size_t)kb * 1024;
+            else if (sscanf(line, "MemTotal: %lu kB", &kb) == 1) mem_total = (size_t)kb * 1024;
+        }
+        fclose(mf);
+    }
+    // Reserve headroom for KV cache, compute buffers, mmap and coordinator overhead.
+    const size_t reserve = (size_t)3 * 1024 * 1024 * 1024;
+    if (mem_free > reserve) mem_free -= reserve; else mem_free = 0;
+    *free = mem_free;
+    *total = mem_total;
 }
 
 static enum ggml_backend_dev_type ggml_backend_rknpu_device_get_type(ggml_backend_dev_t dev) {
     UNUSED(dev);
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    // RK-LLAMA fix: present as GPU so -sm layer distributes weight layers to this
+    // NPU (ACCEL-type devices are compute-only and get 0 layers in the split).
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
 static void ggml_backend_rknpu_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {

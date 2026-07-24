@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <arm_neon.h>
 #include <cstdlib>
+#include <cstring>
 #include <sstream>
 
 namespace {
@@ -64,6 +65,19 @@ const std::vector<std::string>* Rknpu2DeviceConfig::get_active_pattern(int tenso
 
 const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struct ggml_tensor* w_tensor) const {
     if (!w_tensor) return nullptr;
+
+    // A single RKNN allocation (IOMMU domain) is limited to ~2GB (INT32 addressing).
+    // Tensors larger than this (e.g. Gemma-4 per_layer_token_embd, ~2.8GB) cannot be
+    // placed on the NPU -- keep them on CPU to avoid rknn_create_mem failure / abort.
+    if (ggml_nbytes(w_tensor) >= ((size_t)INT32_MAX - 65536)) {
+        return nullptr;
+    }
+
+    // Embedding/output tables are consumed by get_rows (not matmul B) and must stay raw.
+    // Requantizing them to NPU format corrupts the embedding lookup -> keep on CPU.
+    if (w_tensor->name[0] != 0 && (strstr(w_tensor->name, "token_embd") != nullptr)) {
+        return nullptr;
+    }
 
     auto find_pipeline = [this](const std::string& name) -> const Rknpu2HardwarePipeline* {
         for (const auto& pipe : hardware_pipelines) {
