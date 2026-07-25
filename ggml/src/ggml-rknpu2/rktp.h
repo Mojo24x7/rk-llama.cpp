@@ -184,13 +184,16 @@ inline void compute(ggml_backend_t be,const struct ggml_tensor* src0,const float
       K=sl->K; }
     int Nloc=sl->N; int N=(int)src0->ne[1]; int Nrem=N-Nloc;
     std::vector<float> orem((size_t)M*Nrem), oloc((size_t)M*Nloc);
-    // fire remote MM async
-    std::thread th([&]{ std::lock_guard<std::mutex> lk(mx());
+    // NO thread-per-matmul: send x (TCP-buffered -> returns fast, shard computes remote
+    // concurrently), run local slice on THIS NPU meanwhile, then recv the remote result.
+    { std::lock_guard<std::mutex> lk(mx());
         uint8_t cmd=2; uint64_t rid=id; int32_t mm=M,kk=K; uint64_t nb=(uint64_t)M*K*4;
         _sendall(fd(),&cmd,1);_sendall(fd(),&rid,8);_sendall(fd(),&mm,4);_sendall(fd(),&kk,4);_sendall(fd(),&nb,8);_sendall(fd(),x,nb);
-        uint64_t ob=0; _recvall(fd(),&ob,8); if(ob) _recvall(fd(),orem.data(),ob); });
-    sl->run(M,x,oloc.data());     // local slice on THIS NPU  ||  remote on shard
-    th.join();
+    }
+    sl->run(M,x,oloc.data());     // local slice on THIS NPU  ||  remote computing on shard
+    { std::lock_guard<std::mutex> lk(mx());
+        uint64_t ob=0; _recvall(fd(),&ob,8); if(ob) _recvall(fd(),orem.data(),ob);
+    }
     for(int m=0;m<M;m++){ float* dr=dst+(size_t)m*N; const float* lr=oloc.data()+(size_t)m*Nloc; const float* rr=orem.data()+(size_t)m*Nrem;
         for(int n=0;n<Nloc;n++) dr[n]=lr[n];
         for(int n=0;n<Nrem;n++) dr[Nloc+n]=rr[n]; }
