@@ -6,6 +6,7 @@
 #include "rknpu2-quantization.h"
 #include "rknpu2-calibration.h"
 #include "rknpu2-configuration.h"
+#include "rktp.h"
 
 #include <rknn_api.h>
 #include <rknn_matmul_api.h>
@@ -495,6 +496,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             continue;
         }
 
+        if (rktp::enabled() && rktp::is_split(src0)) {
+            float* _tp_dst = (float*)get_tensor_real_ptr(dst);
+            const float* _tp_x = (const float*)get_tensor_real_ptr(src1);
+            rktp::compute(backend, src0, _tp_x, M, _tp_dst);
+            continue;
+        }
+
         // Using next power of two for M for efficient caching
         int M_op = M;
         if (M > 1) {
@@ -879,6 +887,12 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
 
     // Initialize tensor only if it is supported by the pipeline
     if (pipeline) {
+        // TP: row-split tensors live in a separate local Slice buffer, and whole-offloaded
+        // tensors live entirely on the shard. Do NOT pre-allocate their full DMA here or the
+        // coordinator materialises the whole model in NPU (/dev/dri) memory regardless of ship.
+        if (rktp::enabled() && rktp::qualifies(tensor)) {
+            return GGML_STATUS_SUCCESS;
+        }
         size_t offset = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
         size_t size = get_tensor_packed_size(tensor);
         ctx->get_tensor_allocation(offset, size);
@@ -1078,9 +1092,14 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
     size_t tensor_offset_in_virtual = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
 
+    if (pipeline && rktp::enabled() && rktp::qualifies(tensor)) {
+        if (rktp::on_set_tensor(tensor, data, offset, size)) return;
+    }
+
     if (pipeline) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
+        if(getenv("RKNPU_TP_DEBUG")) fprintf(stderr,"[rktp] KEEP-on-coord name=%s K=%d N=%d MB=%.1f\n", tensor->name, K, N, (double)get_tensor_packed_size(tensor)/1048576.0);
         const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
 
         // Initializing Hadamard Transform Logic
@@ -1159,6 +1178,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         rknn_matmul_ctx sync_ctx = g_domain_manager.get_allocator_context(alloc.iommu_domain_id);
         RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
+        rktp::drop_src(data, size);   // release non-split source weight from coordinator file-mmap
     } else {
         memcpy((uint8_t*)tensor->data + offset, data, size);
         // [dbg-stripped] { static int _sd=0; if(_sd<12){ const float* fp=(const float*)data; fprintf(stderr,"RKNPU-SET plain name=%s type=%d off=%zu size=%zu d0..2= %.4f %.4f %.4f\n", tensor->name,(int)tensor->type,offset,size,(double)fp[0],(double)fp[1],(double)fp[2]); _sd++; } }
@@ -1236,7 +1256,24 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
 
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     UNUSED(buft);
-    return get_tensor_packed_size(tensor);
+    size_t full = get_tensor_packed_size(tensor);
+    // TP: split weights only keep their LOCAL row-slice on this (coordinator) NPU; the
+    // rest lives on the shard. Reserve only the local share so the coordinator buffer
+    // isn't committed at full model size (the remote slot is never written here anyway).
+    if (rktp::enabled()) {
+        if (rktp::whole_ok(tensor)) {
+            return 4096;   // whole tensor lives on the shard; reserve almost nothing here
+        }
+        if (rktp::row_ok(tensor)) {
+            int N=(int)tensor->ne[1], Nloc=0, Nrem=0;
+            if (rktp::split_dims(N, Nloc, Nrem) && Nloc>0 && Nloc<N) {
+                size_t loc = (size_t)((double)full * (double)Nloc / (double)N);
+                loc = ((loc + 4095) / 4096) * 4096;
+                if (loc < full) return loc;
+            }
+        }
+    }
+    return full;
 }
 
 
@@ -1256,6 +1293,9 @@ static const char * ggml_backend_rknpu_device_get_description(ggml_backend_dev_t
 
 static void ggml_backend_rknpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     UNUSED(dev);
+    // TP mode: report huge free so llama.cpp keeps ALL weights on RKNPU (no CPU spillover);
+    // rktp then ships row-halves to the shard, so real physical stays balanced.
+    if (getenv("RKNPU_TP_FULLNPU")) { *free = (size_t)128*1024*1024*1024; *total = *free; return; }
     // RK-LLAMA fix: RKNPU weights are drawn from system RAM via IOMMU domains, so
     // report real host memory. This lets -sm layer split weights across multiple
     // RKNPU devices (local + RPC) proportionally instead of dumping all on one.
@@ -1383,12 +1423,14 @@ static ggml_backend_t ggml_backend_rknpu_device_init_backend(ggml_backend_dev_t 
         /* .graph_optimize     = */ NULL,
     };
 
-    return new ggml_backend{
+    ggml_backend_t _rk_bk = new ggml_backend{
         /* .guid    = */ {0},
         /* .iface   = */ rknpu_backend_interface,
         /* .device  = */ dev,
         /* .context = */ ctx,
     };
+    rktp::g_be() = _rk_bk;  // capture backend for eager tensor-parallel slice build
+    return _rk_bk;
 }
 
 
