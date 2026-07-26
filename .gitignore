@@ -145,3 +145,6 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# rktp working backups (local safety, not tracked)
+*.bak.*
