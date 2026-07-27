@@ -989,10 +989,15 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
         auto content         = p.rule("message-content", p.until("<|end|>"));
         auto channel         = p.literal("<|channel|>") + (p.literal("commentary") | p.literal("analysis"));
         auto constrain_type  = p.chars("[A-Za-z0-9_-]", 1, -1);
+        // Harmony allows an optional [<|constrain|>]TYPE between the channel name and
+        // <|message|> on every channel, not just on tool calls.
+        auto chan_constraint = [&]() {
+            return p.optional(p.space() + p.optional(p.literal("<|constrain|>")) + constrain_type);
+        };
 
         // Occasionally, gpt-oss-20b will prefix channels with this commentary
-        auto stray_commentary = p.optional(p.literal("<|channel|>commentary") + p.optional(p.literal(" to=assistant")));
-        auto start_analysis = stray_commentary + p.literal("<|channel|>analysis<|message|>");
+        auto stray_commentary = p.optional(p.literal("<|channel|>commentary") + chan_constraint() + p.optional(p.literal(" to=assistant")));
+        auto start_analysis = stray_commentary + p.literal("<|channel|>analysis") + chan_constraint() + p.literal("<|message|>");
 
         if (extract_reasoning) {
             p.rule("analysis", start_analysis + p.reasoning(content) + end);
@@ -1001,8 +1006,8 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
         }
 
         auto analysis = p.ref("analysis");
-        auto preamble = p.rule("preamble", p.literal("<|channel|>commentary<|message|>") + p.content(content) + end);
-        auto final_msg = p.rule("final", stray_commentary + p.literal("<|channel|>final<|message|>") + p.content(content));
+        auto preamble = p.rule("preamble", p.literal("<|channel|>commentary") + chan_constraint() + p.literal("<|message|>") + p.content(content) + end);
+        auto final_msg = p.rule("final", stray_commentary + p.literal("<|channel|>final") + chan_constraint() + p.literal("<|message|>") + p.content(content));
 
         // Consume any unsolicited tool calls, e.g. builtin functions
         auto unsolicited = p.rule("unsolicited", p.atomic(p.optional(channel) + p.literal(" to=") + content + end));
