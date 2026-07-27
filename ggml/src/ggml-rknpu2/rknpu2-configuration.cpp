@@ -73,6 +73,12 @@ const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struc
         return nullptr;
     }
 
+    // KV-cache tensors are written by compute ops (SET_ROWS), not by set_tensor, so they
+    // must stay in raw layout -- never hand them to the requantizing pipeline.
+    if (w_tensor->name[0] != 0 && strncmp(w_tensor->name, "cache_", 6) == 0) {
+        return nullptr;
+    }
+
     // Embedding/output tables are consumed by get_rows (not matmul B) and must stay raw.
     // Requantizing them to NPU format corrupts the embedding lookup -> keep on CPU.
     if (w_tensor->name[0] != 0 && (strstr(w_tensor->name, "token_embd") != nullptr)) {

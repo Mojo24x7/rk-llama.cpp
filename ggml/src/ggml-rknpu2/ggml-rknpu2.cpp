@@ -371,6 +371,7 @@ struct ggml_backend_rknpu_context {
     // C-matrices cache (M, N, core_id, npu_type_c, domain_id)
     std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> c_buffer_cache;
 
+    static long ctx_miss;
     std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id) {
         std::lock_guard<std::mutex> lock(mutex);
 
@@ -380,6 +381,7 @@ struct ggml_backend_rknpu_context {
             return it->second;
         }
 
+        ctx_miss++;
         auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type, domain_id);
         if (ctx->ctx == 0) {
             return nullptr;
@@ -402,6 +404,7 @@ struct ggml_backend_rknpu_context {
         return ctx;
     }
 };
+long ggml_backend_rknpu_context::ctx_miss = 0;
 
 
 //
@@ -476,6 +479,93 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
 // Forward decl: defined in the Buffer section below, used by MUL_MAT_ID in graph_compute.
 static size_t get_tensor_slice_packed_size(const struct ggml_tensor * tensor);
 
+
+// ---- phase timing (RKNPU_MM_TIME=1) ----
+static bool  g_mmt_on   = getenv("RKNPU_MM_TIME") != nullptr;
+static double g_mmt_ctx = 0, g_mmt_a = 0, g_mmt_c = 0, g_mmt_run = 0, g_mmt_col = 0;
+static long   g_mmt_n = 0, g_mmt_rows = 0;
+static inline double mmt_now() {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+extern "C" void rknpu_mmt_dump(const char* tag) {
+    if (!g_mmt_on) return;
+    fprintf(stderr, "[mmt %s] miss=%ld calls=%ld rows=%ld ctx=%.3f aprep=%.3f cbuf=%.3f run=%.3f collect=%.3f total=%.3f\n",
+            tag, ggml_backend_rknpu_context::ctx_miss, g_mmt_n, g_mmt_rows, g_mmt_ctx, g_mmt_a, g_mmt_c, g_mmt_run, g_mmt_col,
+            g_mmt_ctx + g_mmt_a + g_mmt_c + g_mmt_run + g_mmt_col);
+    g_mmt_ctx = g_mmt_a = g_mmt_c = g_mmt_run = g_mmt_col = 0; g_mmt_n = 0; g_mmt_rows = 0; ggml_backend_rknpu_context::ctx_miss = 0;
+}
+
+
+// ---------------- glue-op support (RKNPU_GLUE=1) ----------------
+// Cheap non-matmul ops are executed with ggml's CPU kernels but stay assigned to the
+// RKNPU device, so their tensors stay in this board's buffer (critical under RPC).
+static bool rknpu_glue_enabled() {
+    static const bool on = getenv("RKNPU_GLUE") != nullptr;
+    return on;
+}
+
+static ggml_backend_dev_t rknpu_cpu_dev() {
+    static ggml_backend_dev_t d = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+        if (reg && ggml_backend_reg_dev_count(reg) > 0) d = ggml_backend_reg_dev_get(reg, 0);
+    }
+    return d;
+}
+
+static ggml_backend_t rknpu_glue_backend() {
+    static ggml_backend_t be = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        ggml_backend_dev_t d = rknpu_cpu_dev();
+        if (d) be = ggml_backend_dev_init(d, nullptr);
+    }
+    return be;
+}
+
+// A matmul B-matrix is only ours if it is a preloaded weight: a graph leaf (not the
+// result of an op) and not a view. KV-cache views / runtime activations are NOT.
+static bool rknpu_is_weight_src(const struct ggml_tensor * t) {
+    if (!t) return false;
+    if (t->view_src != nullptr) return false;
+    if (t->op != GGML_OP_NONE) return false;
+    return true;
+}
+
+static bool rknpu_is_glue_op(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_NONE: case GGML_OP_DUP: case GGML_OP_ADD: case GGML_OP_SUB:
+        case GGML_OP_MUL: case GGML_OP_DIV: case GGML_OP_SCALE: case GGML_OP_SQR:
+        case GGML_OP_SQRT: case GGML_OP_RMS_NORM: case GGML_OP_NORM:
+        case GGML_OP_SOFT_MAX: case GGML_OP_ROPE: case GGML_OP_GLU:
+        case GGML_OP_UNARY: case GGML_OP_GET_ROWS: case GGML_OP_SUM_ROWS:
+        case GGML_OP_ARGSORT: case GGML_OP_CLAMP: case GGML_OP_CONCAT:
+        case GGML_OP_CONT: case GGML_OP_CPY: case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+        case GGML_OP_SET_ROWS: case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_ROPE_BACK: case GGML_OP_DIAG_MASK_INF:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// A src that our pipeline would requantize is stored in NPU layout -> CPU kernels
+// must never read it.
+static bool rknpu_has_pipeline_src(const struct ggml_tensor * op) {
+    const auto& cfg = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const struct ggml_tensor * s = op->src[i];
+        if (!s) continue;
+        if (cfg.resolve_op_support(s) != nullptr) return true;
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
 
@@ -527,6 +617,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16) type_size_packed = 2;
         else if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) type_size_packed = 1;
 
+        if (g_mmt_on) { g_mmt_n++; g_mmt_rows += M; }
+        double _tt = g_mmt_on ? mmt_now() : 0.0;
         size_t current_offset_in_tensor = 0;
         for (size_t k_idx = 0; k_idx < all_k_segments.size(); ++k_idx) {
             const auto& k_seg = all_k_segments[k_idx];
@@ -574,6 +666,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
             }
 
+            if (g_mmt_on) { double _n = mmt_now(); g_mmt_ctx += _n - _tt; _tt = _n; }
             // ========== 2. Preparing A-matrix ==========
             std::vector<float> scales_A(M, 1.0f);
             {
@@ -634,6 +727,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
             }
 
+            if (g_mmt_on) { double _n = mmt_now(); g_mmt_a += _n - _tt; _tt = _n; }
             // ========== 3. Preparing C-matrix ==========
             {
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
@@ -647,6 +741,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
             }
 
+            if (g_mmt_on) { double _n = mmt_now(); g_mmt_c += _n - _tt; _tt = _n; }
             // ========== 4. Running operation ==========
             {
                 #pragma omp parallel for num_threads(num_active_segments)
@@ -658,6 +753,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
             }
 
+            if (g_mmt_on) { double _n = mmt_now(); g_mmt_run += _n - _tt; _tt = _n; }
             // ========== 5. Collecting results ==========
             {
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
@@ -726,6 +822,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     }
                 }
             }
+            if (g_mmt_on) { double _n = mmt_now(); g_mmt_col += _n - _tt; _tt = _n; }
         }
         return GGML_STATUS_SUCCESS;
     };
@@ -763,7 +860,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             {
                 std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
                 auto it = src0_buf_ctx->tensor_allocs.find(tensor_offset_in_virtual);
-                GGML_ASSERT(it != src0_buf_ctx->tensor_allocs.end() && "B-matrix RKNN buffer not found");
+                if (it == src0_buf_ctx->tensor_allocs.end()) {
+                    // Not a requantized weight after all -> run this node with CPU kernels.
+                    ggml_backend_t gb = rknpu_glue_backend();
+                    if (!gb) return GGML_STATUS_FAILED;
+                    struct ggml_cgraph one = ggml_graph_view(cgraph, node_i, node_i + 1);
+                    enum ggml_status gst = ggml_backend_graph_compute(gb, &one);
+                    if (gst != GGML_STATUS_SUCCESS) return gst;
+                    continue;
+                }
                 tensor_fd = it->second.mem->fd;
                 tensor_virt_addr = it->second.mem->virt_addr;
                 b_domain_id = it->second.iommu_domain_id;
@@ -823,7 +928,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             {
                 std::lock_guard<std::mutex> lock(as_buf_ctx->mutex);
                 auto it = as_buf_ctx->tensor_allocs.find(as_off);
-                GGML_ASSERT(it != as_buf_ctx->tensor_allocs.end() && "MoE experts RKNN buffer not found");
+                if (it == as_buf_ctx->tensor_allocs.end()) {
+                    ggml_backend_t gb = rknpu_glue_backend();
+                    if (!gb) return GGML_STATUS_FAILED;
+                    struct ggml_cgraph one = ggml_graph_view(cgraph, node_i, node_i + 1);
+                    enum ggml_status gst = ggml_backend_graph_compute(gb, &one);
+                    if (gst != GGML_STATUS_SUCCESS) return gst;
+                    continue;
+                }
                 tensor_fd = it->second.mem->fd;
                 tensor_virt_addr = it->second.mem->virt_addr;
                 b_domain_id = it->second.iommu_domain_id;
@@ -850,33 +962,133 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // Zero the whole output (each (e,t) column written exactly once below).
             memset(dst_base, 0, (size_t)N * n_used * n_tok * sizeof(float));
 
-            for (int t = 0; t < n_tok; ++t) {
-                for (int e = 0; e < n_used; ++e) {
-                    int eid = ids_data[(size_t)t * (ids->nb[1] / sizeof(int32_t)) + (size_t)e];
-                    if (eid < 0 || (int64_t)eid >= n_expert) continue;
+            const size_t ids_stride = ids->nb[1] / sizeof(int32_t);
 
-                    size_t base_off = (size_t)eid * per_expert_packed;
+            // ---------- BATCHED EXPERT DISPATCH (prefill) ----------
+            // Group every (token,slot) pair by expert id, then run ONE matmul per routed
+            // expert with M = #routed rows. Replaces the M=1-per-(token,expert) dispatch
+            // storm (~n_tok*n_used tiny NPU calls) with n_expert big ones -> compute-bound.
+            // RKNPU_MOE_NOBATCH=1 -> old path. RKNPU_MOE_DBG=1 -> per-node stats.
+            static const bool moe_nobatch = getenv("RKNPU_MOE_NOBATCH") != nullptr;
+            static const int  moe_dbg     = getenv("RKNPU_MOE_DBG") ? atoi(getenv("RKNPU_MOE_DBG")) : 0;
+            static const int  moe_mb      = getenv("RKNPU_MOE_MB") ? std::max(1, atoi(getenv("RKNPU_MOE_MB"))) : 128;
 
-                    std::vector<float> scales_slice;
+            const bool b_row_contig = (b->nb[0] == sizeof(float));
+
+            if (!moe_nobatch && n_tok > 1 && b_row_contig) {
+                std::vector<std::vector<int32_t>> jobs((size_t)n_expert);
+                for (int t = 0; t < n_tok; ++t) {
+                    for (int e = 0; e < n_used; ++e) {
+                        int eid = ids_data[(size_t)t * ids_stride + (size_t)e];
+                        if (eid < 0 || (int64_t)eid >= n_expert) continue;
+                        jobs[(size_t)eid].push_back(t * n_used + e);
+                    }
+                }
+
+                std::vector<float> xbuf, obuf, scales_slice;
+                int n_disp = 0, m_max = 0;
+
+                for (int64_t eid = 0; eid < n_expert; ++eid) {
+                    std::vector<int32_t>& jl = jobs[(size_t)eid];
+                    if (jl.empty()) continue;
+                    const int Mb = (int)jl.size();
+                    if (Mb > m_max) m_max = Mb;
+                    n_disp++;
+
+                    scales_slice.clear();
                     if (blocks_per_expert) {
                         scales_slice.assign(scales_all.begin() + (size_t)eid * blocks_per_expert,
                                             scales_all.begin() + ((size_t)eid + 1) * blocks_per_expert);
                     }
 
-                    const float* x = (const float*)(b_base + (size_t)(e % r) * b->nb[1] + (size_t)t * b->nb[2]);
-                    float* dst_col = (float*)(dst_base + (size_t)e * dst->nb[1] + (size_t)t * dst->nb[2]);
+                    // Fixed-size chunks keep the number of distinct M_op values (and hence
+                    // matmul contexts / DMA fds / A-C buffers) bounded.
+                    for (int c0 = 0; c0 < Mb; c0 += moe_mb) {
+                        const int Mc = std::min(moe_mb, Mb - c0);
 
-                    enum ggml_status st = run_slice(pipeline, tensor_fd, tensor_virt_addr, b_domain_id, base_off,
-                                                    scales_slice, s_vec, 1, K, N, x, K, dst_col);
-                    if (st != GGML_STATUS_SUCCESS) return st;
+                        // Pad to a fixed ladder so only a handful of distinct M_op values
+                        // (and therefore matmul contexts / DMA fds) ever get created.
+                        const int Mr = moe_mb;  // single M_op: RKNPU handle space is ~64k
+
+                        xbuf.assign((size_t)Mr * (size_t)K, 0.0f);
+                        #pragma omp parallel for
+                        for (int m = 0; m < Mc; ++m) {
+                            const int t = jl[c0 + m] / n_used;
+                            const int e = jl[c0 + m] % n_used;
+                            const float* srow = (const float*)(b_base + (size_t)(e % r) * b->nb[1]
+                                                                     + (size_t)t * b->nb[2]);
+                            memcpy(xbuf.data() + (size_t)m * (size_t)K, srow, (size_t)K * sizeof(float));
+                        }
+
+                        obuf.assign((size_t)Mr * (size_t)N, 0.0f);
+
+                        enum ggml_status st = run_slice(pipeline, tensor_fd, tensor_virt_addr, b_domain_id,
+                                                        (size_t)eid * per_expert_packed,
+                                                        scales_slice, s_vec, Mr, K, N,
+                                                        xbuf.data(), K, obuf.data());
+                        if (st != GGML_STATUS_SUCCESS) return st;
+
+                        #pragma omp parallel for
+                        for (int m = 0; m < Mc; ++m) {
+                            const int t = jl[c0 + m] / n_used;
+                            const int e = jl[c0 + m] % n_used;
+                            float* dst_col = (float*)(dst_base + (size_t)e * dst->nb[1]
+                                                               + (size_t)t * dst->nb[2]);
+                            memcpy(dst_col, obuf.data() + (size_t)m * (size_t)N, (size_t)N * sizeof(float));
+                        }
+                    }
+                }
+
+                if (moe_dbg) {
+                    fprintf(stderr, "[moe-batch] K=%d N=%d n_tok=%d n_used=%d experts=%d m_max=%d\n",
+                            K, N, n_tok, n_used, n_disp, m_max);
+                }
+            } else {
+                for (int t = 0; t < n_tok; ++t) {
+                    for (int e = 0; e < n_used; ++e) {
+                        int eid = ids_data[(size_t)t * (ids->nb[1] / sizeof(int32_t)) + (size_t)e];
+                        if (eid < 0 || (int64_t)eid >= n_expert) continue;
+
+                        size_t base_off = (size_t)eid * per_expert_packed;
+
+                        std::vector<float> scales_slice;
+                        if (blocks_per_expert) {
+                            scales_slice.assign(scales_all.begin() + (size_t)eid * blocks_per_expert,
+                                                scales_all.begin() + ((size_t)eid + 1) * blocks_per_expert);
+                        }
+
+                        const float* x = (const float*)(b_base + (size_t)(e % r) * b->nb[1] + (size_t)t * b->nb[2]);
+                        float* dst_col = (float*)(dst_base + (size_t)e * dst->nb[1] + (size_t)t * dst->nb[2]);
+
+                        enum ggml_status st = run_slice(pipeline, tensor_fd, tensor_virt_addr, b_domain_id, base_off,
+                                                        scales_slice, s_vec, 1, K, N, x, K, dst_col);
+                        if (st != GGML_STATUS_SUCCESS) return st;
+                    }
                 }
             }
 
         } else {
+            if (!rknpu_glue_enabled()) continue;
+
+            // Batch the run of consecutive non-matmul nodes into one CPU sub-graph.
+            int j = node_i;
+            while (j < cgraph->n_nodes) {
+                enum ggml_op o = cgraph->nodes[j]->op;
+                if (o == GGML_OP_MUL_MAT || o == GGML_OP_MUL_MAT_ID) break;
+                j++;
+            }
+            ggml_backend_t gb = rknpu_glue_backend();
+            if (gb) {
+                struct ggml_cgraph view = ggml_graph_view(cgraph, node_i, j);
+                enum ggml_status gst = ggml_backend_graph_compute(gb, &view);
+                if (gst != GGML_STATUS_SUCCESS) return gst;
+            }
+            node_i = j - 1;
             continue;
         }
     }
 
+    if (g_mmt_on) rknpu_mmt_dump("graph");
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1437,11 +1649,21 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
     // Getting the current device configuration
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
 
+    // Glue ops: claimed so the layer stays on this device (executed with CPU kernels).
+    if (rknpu_glue_enabled() && op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
+        if (!rknpu_is_glue_op(op->op)) return false;
+        if (rknpu_has_pipeline_src(op)) return false;
+        ggml_backend_dev_t cd = rknpu_cpu_dev();
+        if (!cd) return false;
+        return ggml_backend_dev_supports_op(cd, op);
+    }
+
     switch (op->op) {
         case GGML_OP_NONE:
             return true;
 
         case GGML_OP_MUL_MAT: {
+            if (!rknpu_is_weight_src(op->src[0])) return false;
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
 
@@ -1491,6 +1713,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                 return false;
             }
 
+            if (!rknpu_is_weight_src(op->src[0])) return false;
             const struct ggml_tensor * src0 = op->src[0]; // experts: [K, N, n_expert]
             const struct ggml_tensor * src1 = op->src[1]; // activations: [K, n_expert_used, n_tokens]
             const struct ggml_tensor * src2 = op->src[2]; // ids: [n_expert_used, n_tokens] (i32)
