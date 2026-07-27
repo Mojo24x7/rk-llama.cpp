@@ -131,7 +131,10 @@ inline bool split_dims(int N,int& Nloc,int& Nrem){
 inline bool _ship(int sfd,uint64_t rid,int type,int K,int rows,size_t row,const uint8_t* base,int r0){
     uint8_t cmd=1; int32_t ty=type,kk=K,nn=rows; uint64_t nb=(uint64_t)rows*row;
     if(!_sendall(sfd,&cmd,1)||!_sendall(sfd,&rid,8)||!_sendall(sfd,&ty,4)||!_sendall(sfd,&kk,4)||!_sendall(sfd,&nn,4)||!_sendall(sfd,&nb,8)||!_sendall(sfd,base+(size_t)r0*row,nb)){ fprintf(stderr,"[rktp] ship fail\n"); return false; }
-    int32_t ok=0; _recvall(sfd,&ok,4); return true;
+    int32_t ok=0; _recvall(sfd,&ok,4);
+    if(getenv("RKNPU_TP_CK")) { fprintf(stderr,"[SHIPDBG] fd=%d rid=%p type=%d K=%d rows=%d r0=%d nb=%llu ok=%d\n",
+        sfd,(void*)(uintptr_t)rid,type,K,rows,r0,(unsigned long long)nb,ok); fflush(stderr); }
+    return true;
 }
 
 inline bool on_set_tensor(const struct ggml_tensor* t,const void* data,size_t offset,size_t size){
@@ -170,8 +173,12 @@ inline bool is_split(const struct ggml_tensor* t){
     return pend().count(id)||built().count(id)||rfull().count(id);
 }
 
+inline bool tpck_on(){ static int v=-1; if(v<0) v = getenv("RKNPU_TP_CK")?1:0; return v==1; }
+#define TPCK(...) do{ if(rktp::tpck_on()){ fprintf(stderr,"[tpck] " __VA_ARGS__); fflush(stderr);} }while(0)
+
 inline void compute(ggml_backend_t be,const struct ggml_tensor* src0,const float* x,int M,float* dst){
     uintptr_t id=(uintptr_t)src0->data;
+    TPCK("enter name=%s M=%d N=%lld id=%p\n", src0->name?src0->name:"?", M, (long long)src0->ne[1], (void*)id);
     // WHOLE-OFFLOAD: full tensor on one shard
     { std::lock_guard<std::mutex> lk(mx());
       auto rf=rfull().find(id);
@@ -191,8 +198,18 @@ inline void compute(ggml_backend_t be,const struct ggml_tensor* src0,const float
             built()[id]=sl; }
       K=sl->K; }
     int Nloc=sl->N; int N=(int)src0->ne[1];
+    TPCK("slice ok Nloc=%d K=%d N=%d\n", Nloc, K, N);
     auto parts=compute_parts(N);   // deterministic; parts[0]==Nloc
     int ns=nsh();
+    if((int)parts.size()!=ns+1 || parts[0]!=Nloc){
+        fprintf(stderr,"[rktp] RKTP_GEOM_FAIL %s: parts.size=%zu expected=%d parts[0]=%d Nloc=%d N=%d\n",
+            src0->name?src0->name:"?", parts.size(), ns+1, parts.empty()?-1:parts[0], Nloc, N);
+        GGML_ABORT("rktp: split geometry mismatch");
+    }
+    { std::string _ps; for(size_t _i=0;_i<parts.size();++_i){ _ps += std::to_string(parts[_i]); _ps += " "; }
+      TPCK("parts n=%zu [%s] ns=%d  (need n==%d, parts[0]==Nloc=%d)\n", parts.size(), _ps.c_str(), ns, ns+1, Nloc); }
+    if((int)parts.size() != ns+1){ TPCK("!!! PARTS SIZE MISMATCH -> would index out of bounds\n"); }
+    else if(parts[0]!=Nloc){ TPCK("!!! parts[0]=%d != Nloc=%d -> concat/recv geometry wrong\n", parts[0], Nloc); }
     std::vector<float> oloc((size_t)M*Nloc);
     std::vector<std::vector<float>> orem(ns);
     // send x to ALL shards (TCP-buffered -> they compute concurrently)
@@ -200,18 +217,34 @@ inline void compute(ggml_backend_t be,const struct ggml_tensor* src0,const float
       for(int i=0;i<ns;i++){ int f=fds()[i]; uint8_t cmd=2; uint64_t rid=id; int32_t mm=M,kk=K; uint64_t nb=(uint64_t)M*K*4;
           _sendall(f,&cmd,1);_sendall(f,&rid,8);_sendall(f,&mm,4);_sendall(f,&kk,4);_sendall(f,&nb,8);_sendall(f,x,nb); }
     }
+    TPCK("sent x to %d shard(s)\n", ns);
     sl->run(M,x,oloc.data());     // local slice while shards compute
+    TPCK("local run done\n");
     { std::lock_guard<std::mutex> lk(mx());
-      for(int i=0;i<ns;i++){ int f=fds()[i]; uint64_t ob=0; _recvall(f,&ob,8); orem[i].resize(ob/4); if(ob) _recvall(f,orem[i].data(),ob); }
+      for(int i=0;i<ns;i++){ int f=fds()[i]; uint64_t ob=0; _recvall(f,&ob,8);
+          TPCK("recv shard%d ob=%llu bytes (expect %llu = M*parts[%d]*4)\n", i,(unsigned long long)ob,
+               (unsigned long long)((uint64_t)M*(uint64_t)((int)parts.size()>i+1?parts[i+1]:-1)*4), i+1);
+          const uint64_t want=(uint64_t)M*(uint64_t)parts[i+1]*4;
+          if(ob!=want){
+              fprintf(stderr,"[rktp] RKTP_GEOM_FAIL %s: shard%d returned %llu bytes, expected %llu "
+                             "(M=%d rows=%d). Peer did not compute this weight -- most often a STALE "
+                             "tp_shard binary (rebuild it from tp_shard.cpp) or a lost LOAD.\n",
+                      src0->name?src0->name:"?", i, (unsigned long long)ob, (unsigned long long)want, M, parts[i+1]);
+              GGML_ABORT("rktp: shard reply size mismatch");
+          }
+          orem[i].resize(ob/4); if(ob) _recvall(f,orem[i].data(),ob); }
     }
+    TPCK("recv done\n");
     // concat: [local | shard0 | shard1 | ...] per token
     for(int m=0;m<M;m++){ float* dr=dst+(size_t)m*N;
         const float* lr=oloc.data()+(size_t)m*Nloc;
         for(int n=0;n<Nloc;n++) dr[n]=lr[n];
         int off=Nloc;
         for(int i=0;i<ns;i++){ int len=parts[i+1]; const float* rr=orem[i].data()+(size_t)m*len;
+            if((size_t)(m+1)*len > orem[i].size()){ TPCK("!!! shard%d short buffer: have %zu floats need %zu\n", i, orem[i].size(), (size_t)(m+1)*len); }
             for(int n=0;n<len;n++) dr[off+n]=rr[n]; off+=len; }
     }
+    TPCK("concat done -> exit\n");
 }
 
 inline void Slice::build(ggml_backend_t b,int t,int K_,int N_,const void* bytes,size_t nb){

@@ -843,7 +843,22 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             if (rktp::enabled() && rktp::is_split(src0)) {
                 float* _tp_dst = (float*)get_tensor_real_ptr(dst);
                 const float* _tp_x = (const float*)get_tensor_real_ptr(src1);
+                static const bool _mdbg = getenv("RKNPU_TP_MDBG") != nullptr;
+                if (_mdbg) {
+                    fprintf(stderr,
+                        "[rktp-M] %s M=%d K=%d N=%d | src1 t=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] cont=%d"
+                        " | dst t=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] cont=%d\n",
+                        src0->name ? src0->name : "?", M, K, N,
+                        ggml_type_name(src1->type),
+                        (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2], (long long)src1->ne[3],
+                        src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3], (int)ggml_is_contiguous(src1),
+                        ggml_type_name(dst->type),
+                        (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3],
+                        dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], (int)ggml_is_contiguous(dst));
+                    fflush(stderr);
+                }
                 rktp::compute(backend, src0, _tp_x, M, _tp_dst);
+                if (_mdbg) { fprintf(stderr, "[rktp-M]   ok %s\n", src0->name ? src0->name : "?"); fflush(stderr); }
                 continue;
             }
 
