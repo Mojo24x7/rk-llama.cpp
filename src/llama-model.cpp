@@ -2685,8 +2685,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
+    // Hybrid (linear-attention) models: optionally keep recurrent layers on the
+    // CPU device. llama_context disables the fused Gated Delta Net kernel unless
+    // each GDN node and its layer share a device; no accelerator backend
+    // implements GDN, so offloading a recurrent layer silently trades the fused
+    // kernel for that layer's matmuls - a large net loss (see this commit msg).
+    const bool recurrent_on_cpu = [] {
+        const char * v = getenv("LLAMA_RECURRENT_ON_CPU");
+        return v && *v && !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
+    }();
+
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
+        if (recurrent_on_cpu && il < int(hparams.n_layer) && hparams.is_recurrent(il)) {
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s (recurrent)\n", il, ggml_backend_dev_name(cpu_dev));
+            return {cpu_dev, &pimpl->cpu_buft_list};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
