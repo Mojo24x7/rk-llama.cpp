@@ -220,6 +220,53 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
             /* .use_hadamard  = */ true
+        },
+        // ---- asymmetric pipelines: low-precision WEIGHTS, higher-precision ACTIVATIONS ----
+        // Halves the weight bytes the NPU reads per token vs W8A8 while keeping the
+        // activations un-quantised (fp16), which is where int4 damage actually comes from.
+        {
+            /* .pipeline_name = */ "W4A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT4,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT4_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 64,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
+        },
+        {
+            /* .pipeline_name = */ "W4A16_HADAMARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT4,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT4_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 64,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ true
+        },
+        {
+            /* .pipeline_name = */ "W8A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT8,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 32,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
+        },
+        {
+            /* .pipeline_name = */ "W4A8_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_INT8,
+            /* .npu_type_b    = */ NPU_TYPE_INT4,
+            /* .npu_type_c    = */ NPU_TYPE_INT32,
+            /* .mm_type       = */ RKNN_INT8_MM_INT4_TO_INT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 64,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
         }
     };
 

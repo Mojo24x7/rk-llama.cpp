@@ -1,5 +1,6 @@
 #include "ggml-rknpu2.h"
 #include "ggml-backend-impl.h"
+#include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 
@@ -501,7 +502,12 @@ extern "C" void rknpu_mmt_dump(const char* tag) {
 // Cheap non-matmul ops are executed with ggml's CPU kernels but stay assigned to the
 // RKNPU device, so their tensors stay in this board's buffer (critical under RPC).
 static bool rknpu_glue_enabled() {
-    static const bool on = getenv("RKNPU_GLUE") != nullptr;
+    static const bool on = []() {
+        const char * e = getenv("RKNPU_GLUE");
+        if (!e || !*e) return false;
+        // honour the value: 0 / n / f disable
+        return !(e[0] == '0' || e[0] == 'n' || e[0] == 'N' || e[0] == 'f' || e[0] == 'F');
+    }();
     return on;
 }
 
@@ -522,7 +528,18 @@ static ggml_backend_t rknpu_glue_backend() {
     if (!tried) {
         tried = true;
         ggml_backend_dev_t d = rknpu_cpu_dev();
-        if (d) be = ggml_backend_dev_init(d, nullptr);
+        if (d) {
+            be = ggml_backend_dev_init(d, nullptr);
+            if (be) {
+                // Glue ops at M=1 are tiny vector ops; a 4-thread pool here just
+                // adds a barrier + contends with the main compute pool. Default 1.
+                int nt = 4;  // = ggml default (original behaviour); GT=1 measured -1%
+                const char * e = getenv("RKNPU_GLUE_THREADS");
+                if (e && *e) nt = atoi(e);
+                if (nt < 1) nt = 1;
+                ggml_backend_cpu_set_n_threads(be, nt);
+            }
+        }
     }
     return be;
 }
