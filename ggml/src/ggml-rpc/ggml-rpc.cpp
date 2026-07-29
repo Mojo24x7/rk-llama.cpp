@@ -486,7 +486,8 @@ static void ggml_backend_rpc_buffer_memset_tensor(
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    static const bool rpc_use_hash = getenv("GGML_RPC_HASH") != nullptr;
+    if (rpc_use_hash && size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
         request.offset = offset;
@@ -500,12 +501,17 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         }
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
+    // Streamed in three writes (wire-identical) to avoid a full-size staging copy.
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t> input(input_size, 0);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    uint8_t hdr[sizeof(rpc_tensor) + sizeof(uint64_t)];
+    memcpy(hdr, &rpc_tensor, sizeof(rpc_tensor));
+    memcpy(hdr + sizeof(rpc_tensor), &offset, sizeof(offset));
+    uint8_t cmd_byte = RPC_CMD_SET_TENSOR;
+    uint64_t wire_size = input_size;
+    bool status = send_data(ctx->sock->fd, &cmd_byte, sizeof(cmd_byte))
+               && send_data(ctx->sock->fd, &wire_size, sizeof(wire_size))
+               && send_data(ctx->sock->fd, hdr, sizeof(hdr))
+               && send_data(ctx->sock->fd, data, size);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -1902,9 +1908,19 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    // RK-LLAMA fix: the RPC peer is always a remote RKNPU device. Delegate to the
+    // coordinator local RKNPU device supports_op (identical hardware + checks) so
+    // ONLY ops the remote NPU can run (MUL_MAT w/ matching align/type) are offloaded;
+    // get_rows/norm/rope/softmax/SET_ROWS etc. stay on the coordinator CPU.
+    static ggml_backend_dev_t rknpu_dev = []() -> ggml_backend_dev_t {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("RKNPU");
+        if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) return nullptr;
+        return ggml_backend_reg_dev_get(reg, 0);
+    }();
+    if (rknpu_dev != nullptr) {
+        return ggml_backend_dev_supports_op(rknpu_dev, op);
+    }
+    return op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_NONE;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
