@@ -163,8 +163,13 @@ cd rk-llama.cpp
 `--depth 1` keeps it to a few hundred MB; the full llama.cpp history is large. Drop
 it if you intend to rebase onto upstream yourself.
 
-Branches: **`rknpu2-current`** is this work (default). **`rknpu2`** is
-invisiofficial's original 12 commits, untouched.
+Branches: **`rknpu2-current`** is this work on current upstream (default).
+**`rknpu2`** is the same work on invisiofficial's May-2026 base, i.e. our 18
+commits as originally authored, kept for reference. **`rknpu2-next`** is a
+single squashed port of the backend onto llama.cpp master.
+
+invisiofficial's original 12 commits are untouched in their own repository:
+<https://github.com/invisiofficial/rk-llama.cpp/tree/rknpu2>.
 
 ### 3. Build
 
