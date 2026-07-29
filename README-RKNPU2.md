@@ -93,8 +93,8 @@ than repacked into RAM:
   not model a memory-mapped buffer as reclaimable.
 
 Measured on 16 GB: a 20.8 GB model loads in 35 s; a 60 GB model runs at
-0.88 t/s. See [WHY-32GB.md](WHY-32GB.md) for what residency costs and what more
-RAM buys.
+0.88 t/s. See [MEMORY-RESIDENCY.md](MEMORY-RESIDENCY.md) for how residency affects
+throughput.
 
 ## Quantisation on this hardware
 
