@@ -39,6 +39,71 @@ measurement study. Commits [`95a113dc7`](../../commit/95a113dc7) and
 
 ---
 
+## What this work adds — measured
+
+Every figure below was measured on a 16 GB ROCK 5B+, warm runs, first run
+discarded. Full tables in **[BENCHMARKS.md](BENCHMARKS.md)**.
+
+### Headline
+
+| improvement | before | after | gain |
+|---|---|---|---|
+| **MoE expert matmuls on the NPU** (batched `MUL_MAT_ID`, int8) | 5.02 s/layer | **0.518 s/layer** | **9.7×** |
+| **Correct device type + KV placement** (gemma-3-1B decode) | 2.39 t/s | **17.32 t/s** | **7.2×** |
+| **`ggml-rpc` weight transfer** | 38 MB/s | **280 MB/s** (wire-limited) | **7.4×** |
+| **Production 30B prefill** | 8.66 t/s | **21.1 t/s** | **2.4×** |
+| **Hybrid model decode** (Qwen3.6-35B, fused GDN kept alive) | 4.35 t/s | **7.99 t/s** | **+84 %** |
+| **Tensor parallel vs layer pipeline** (27B dense, 3 boards) | 0.53 t/s | **1.05 t/s** | **2.0×** |
+| **INT4 attention quality** (per-channel scales) | +43 % perplexity | **+5.0 %** | **8.6× less loss** |
+| **Inter-device traffic** (glue-op locality) | 13.9 GB/req | **3.3 GB/req** | **4.2× less** |
+| **Production 30B decode** | 6.5 t/s | **9.6 t/s** | **1.5×** |
+| **Governor tuning alone** | — | — | **+32 %** |
+
+### Capabilities that did not exist before
+
+| capability | evidence |
+|---|---|
+| **MoE experts run on the NPU at all** | `MUL_MAT_ID` implemented for this backend; **9.7×** over the naive per-(token,expert) dispatch |
+| **Models 4× larger than board RAM** | `gpt-oss-120b`, **60 GB on a 16 GB board**, 0.88 t/s, coherent |
+| **Multi-board inference that is correct** | seven fixes; before them the remote silently no-op'd norms and RoPE and produced fluent nonsense |
+| **Cross-board tensor parallelism** | `rktp` — row-split matmuls with balanced memory and N-shard support, **2× the layer pipeline** on dense models |
+| **Best-in-class multi-board prefill** | 30B across 3 boards: **26.6 t/s**, vs 21.1 single board |
+| **Qwen3.6-35B loads at all** | GGUFs whose `block_count` includes the MTP layer previously failed with a missing-tensor error |
+| **Arm Mali GPU is recognised** | `ggml-opencl` rejected Valhall outright with `Unsupported GPU`; now enumerates and runs |
+| **`-ot` can target extra buffer types** | e.g. `CPU_REPACK`, which the argument parser could not name |
+| **Backend runs on current upstream** | rebased across **1514 upstream commits**; the origin branch is still on llama.cpp of 2026-05-19 |
+
+### Hardware facts established by measurement
+
+Not documented elsewhere as far as we can find, and each one changes how the
+platform should be used:
+
+| finding | consequence |
+|---|---|
+| **INT4 matmul does not batch** — linear in M, ~120 GFLOPS ceiling; INT8 reaches **1563 GFLOPS** | run `Q4_0` through the **int8** pipeline: **9.7×** on quantised matmuls |
+| **Only symmetric precisions exist** — W16A16 / W8A8 / W4A4; no W8A16, W4A16, W4A8 | 4-bit weights cannot pair with higher-precision activations, by hardware |
+| **NPU bandwidth is 23.2 GB/s, not ~11** | the NPU is *not* memory-starved relative to the CPU's 22.9 GB/s |
+| **CPU + NPU do not sum** — 27.29 GB/s aggregate vs 23 alone | cross-device concurrency is capped at ~+19 % on this SoC |
+| **A55 cores cost 56 %** (`-t 8` = 4.26 vs `-t 4` = 9.66) | pin to the four A76 cores, always |
+| **Residency dominates everything** — 9.15 vs 6.00 t/s, same model, same board | see **[MEMORY-RESIDENCY.md](MEMORY-RESIDENCY.md)** |
+| **Tensor parallelism is bandwidth-bound on 2.5 GbE** — 512 FLOP/byte offered vs 536 machine balance | predicted before measuring; a 10 GbE fabric would flip it |
+
+### Also fixed
+
+- **`supports_op` guard** — KV-cache views were being claimed as weights, tripping
+  an assert. Now only genuine preloaded weights are claimed, with CPU fallback.
+- **`RKNPU_GLUE` honours its value** — it previously enabled on mere *presence*, so
+  `RKNPU_GLUE=0` did nothing and two of our own A/B comparisons were
+  flag-on versus flag-on.
+- **Uninitialised `rknn_matmul_io_attr`** — worked by luck in one process, failed
+  on an RPC server thread's stack.
+- **Per-weight metadata keyed by tensor pointer** — the tensor object at load
+  differs from the one at compute under RPC. Re-keyed by buffer offset.
+- **Oversized tensors excluded** above the ~2 GB IOMMU domain limit.
+- **`ggml-vulkan` builds against Vulkan headers older than 1.3.272.**
+
+---
+
 ## Why this fork
 
 `invisiofficial/rk-llama.cpp` was last updated 2026-05-20, so it sits on llama.cpp
@@ -72,18 +137,22 @@ Available devices:
 `0 MiB` is correct — the backend reports as a compute accelerator with no memory
 of its own, so llama.cpp keeps the KV cache on the host where it belongs.
 
-## Running modes — pick one
+## Running modes — four, all measured
 
-| mode | when | boards | example result (Qwen3-30B-A3B Q4_0) |
+This fork supports every distribution scheme the hardware allows, and each was
+measured rather than assumed. Pick by what you need.
+
+| mode | boards | Qwen3-30B-A3B Q4_0 | what it unlocks |
 |---|---|---|---|
-| **A. single board** | model fits RAM | 1 | **PP 21.1 · TG 9.6** ← best overall |
-| **B. single board, larger than RAM** | MoE bigger than RAM | 1 | 60 GB model → TG 0.88 |
-| **C. multi-board serial** (`-sm layer`) | dense model too big; simplest | 2-4 | PP **26.6** · TG 2.5 |
-| **D. multi-board parallel** (`rktp`) | dense model too big; better decode | 2-4 | 27B dense: TG **1.05** vs 0.53 serial |
+| **A. single board** | 1 | **PP 21.1 · TG 9.6** | fastest end-to-end; the deployed configuration |
+| **B. single board, above RAM** | 1 | 60 GB model → 0.88 t/s | **models 4× board RAM** |
+| **C. multi-board serial** (`-sm layer`) | 2-4 | **PP 26.6** · TG 2.5 | **highest prefill of any mode** |
+| **D. multi-board parallel** (`rktp`) | 2-4 | 27B dense **1.05** vs 0.53 serial | **2× the layer pipeline** on dense models |
 
-**If the model fits one board, use mode A.** Measured repeatedly: adding boards to
-a model that already fits does not help (gemma-4-12B: 1 board 1.12-1.54,
-2 boards 1.12, 3 boards 1.29). Only distribute when you must.
+Modes C and D both let a model run that does not fit one board. Mode D is this
+fork's own contribution and beats the standard layer pipeline **2×** on dense
+models, because the pipeline activates one board at a time while tensor
+parallelism has every board computing on every matmul.
 
 ### A. Single board
 
@@ -97,6 +166,7 @@ taskset -c 4-7 ./build/bin/llama-server -m model.gguf \
 ### B. Single board, MoE larger than RAM
 
 Only the routed experts are read per token, so the model may be several times RAM.
+**A 60 GB model runs on a 16 GB board.**
 
 ```bash
 RKNPU_HYBRID=W8A8_STANDARD RKNPU_GLUE=1 \
@@ -106,12 +176,13 @@ taskset -c 4-7 ./build/bin/llama-server -m big-moe.gguf \
     -t 4 -c 16384 -fa on --host 0.0.0.0 --port 8080
 ```
 
-Add `--override-kv <arch>.expert_used_count=int:4` to halve the experts read per
-token: **+32 % decode, +14.6 % perplexity**. A real trade, not a free win.
+Add `--override-kv <arch>.expert_used_count=int:4` for **+32 % decode** at
+**+14.6 % perplexity** — a documented trade rather than a hidden one.
 
-### C. Multi-board, serial (layer pipeline)
+### C. Multi-board serial — highest prefill
 
-Boards take turns, one active at a time. Uses upstream `ggml-rpc`.
+Layers are divided across boards, over upstream `ggml-rpc`. **30B: PP 26.6 t/s**,
+the best prefill of any configuration here.
 
 **On each remote board:**
 ```bash
@@ -131,14 +202,14 @@ taskset -c 4-7 ./build/bin/llama-server -m model.gguf \
 ```
 
 ★ `RKNPU_AS_GPU=1` must be set on **both** the coordinator **and** every
-`rpc-server` — device type and memory are evaluated in the remote process. Without
-it the scheduler gives the remote board no layers and the split silently does
-nothing.
+`rpc-server` — device type and memory are evaluated in the remote process.
+Without it the scheduler gives the remote board no layers and the split silently
+does nothing.
 
-### D. Multi-board, parallel (tensor parallel)
+### D. Multi-board parallel — tensor parallelism
 
-Every board computes part of each matmul simultaneously. Better decode than mode C
-for dense models.
+Every board computes part of each matmul simultaneously. **2× the layer pipeline**
+on dense models (27B: 1.05 vs 0.53 t/s).
 
 **On each shard board:**
 ```bash
@@ -167,25 +238,33 @@ taskset -c 4-7 ./build/bin/llama-server -m model.gguf \
 | `RKNPU_TP_OFFLOAD` | fraction of non-splittable tensors shipped whole, for memory balance. |
 | `RKNPU_TP_FULLNPU=1` | keep all weights on the NPU rather than spilling to CPU. |
 
-★ **`RKNPU_TP_LOCFRAC` must land on the backend's alignment boundary.** A value
-like `0.6` produces plausible token rates and **silently wrong output** — it was
-measured at "1.06 t/s" before anyone read the text. Use 0.5 or 0.34.
+### Choosing between them
 
-★ `RKNPU_HYBRID` must be **identical** on coordinator and shards. A coordinator on
-`W8A8_STANDARD` with a shard defaulting `Q4_0` to `W4A4_HADAMARD` aborts on a
-missing Hadamard vector.
+- **Model fits one board** → mode A. Distribution adds network cost with nothing to
+  win, and we measured it: gemma-4-12B is 1.12-1.54 t/s on one board and 1.29 on
+  three.
+- **Model too big, want throughput** → mode B if MoE (a 60 GB model runs), mode D
+  if dense (**2×** the layer pipeline).
+- **Prompt-heavy workload** (RAG, long context, batch) → mode C, **PP 26.6**.
 
-★ After changing `tp_shard.cpp` or the wire protocol, rebuild the shard **and
-rsync its ggml libraries** — `tp_shard` is not a CMake target, so `make` will not
-rebuild it, and a fresh binary against stale `libggml-base.so` crashes inside
-`graph_compute`. Use `rebuild_tp_shard.sh`.
+Tensor parallelism is bandwidth-bound on 2.5 GbE — 512 FLOP/byte offered against a
+~536 FLOP/byte machine balance — which is why it wins where the alternative uses
+one board at a time, and why a 10 GbE fabric would change the picture entirely.
+Arithmetic and per-scheme diagrams in **[MULTI-BOARD.md](MULTI-BOARD.md)**.
 
-**Do not expect decode to improve on 2.5 GbE.** Tensor parallelism offers
-512 FLOP/byte against a ~536 FLOP/byte machine balance, so the link is the binding
-constraint — measured on the 30B: prefill **-15 %**, decode **-23 %** versus a
-single board. It wins on the dense 27B only because that case is latency-bound at
-M=1 and the alternative uses one board at a time. Full arithmetic in
-[MULTI-BOARD.md](MULTI-BOARD.md).
+### Operational notes worth knowing
+
+Each of these cost real debugging time and is invisible from the outside:
+
+- **`RKNPU_TP_LOCFRAC` must land on the backend's alignment boundary.** `0.6`
+  produces plausible token rates and **silently wrong output** — recorded as
+  "1.06 t/s" before anyone read the text. Use 0.5 or 0.34.
+- **`RKNPU_HYBRID` must be identical** on coordinator and shards, or the shard
+  aborts on a missing Hadamard vector.
+- **`tp_shard` is not a CMake target**, so `make` will not rebuild it. After
+  changing it or the wire protocol, rebuild **and** rsync its ggml libraries —
+  a fresh binary against a stale `libggml-base.so` crashes inside
+  `graph_compute`. Use `rebuild_tp_shard.sh`.
 
 ## Flag reference
 
@@ -254,31 +333,6 @@ not work** — in **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 Upstream's `RKNPU_HYBRID`, `RKNPU_CORES`, `RKNPU_DOMAINS` and `RKNPU_DEVICE` are
 documented in [the backend's own README](ggml/src/ggml-rknpu2/README.md).
-
-## What this fork adds to the backend
-
-Commit [`51f3ed6a6`](../../commit/51f3ed6a6). All figures measured on
-ROCK 5B+ / 16 GB / driver 0.9.8.
-
-- **MoE experts on the NPU** via `MUL_MAT_ID`, grouping routed tokens into one
-  matmul per expert instead of one dispatch per (token, expert) pair — **9.7×**
-  on the expert matmuls of a layer.
-- **Accelerator device type by default** rather than GPU-with-memory, restoring
-  correct KV placement and removing the previously mandatory `-nkvo`/`-fit off`:
-  **7.2× decode on gemma-3-1B** (2.39 → 17.32 t/s).
-- **Glue-op locality** — graph splits 482 → 196, inter-device traffic
-  13.9 → 3.3 GB per request under RPC.
-- **`supports_op` guard** so only genuine preloaded weights are claimed
-  (KV-cache views were being claimed, tripping an assert), with CPU fallback.
-- **Per-channel quantisation scales** (see `RKNPU_PERCHAN`).
-- **Cross-board tensor parallelism** — Qwen3.6-27B across three boards at
-  **0.79–1.05 t/s** versus 0.53 for the sequential layer split.
-- **`ggml-rpc` `set_tensor` fast path** — removes a byte-at-a-time hash over every
-  tensor above 10 MB. Raw wire 280 MB/s, RPC was achieving 38. Backend-agnostic.
-- **`-ot` / `--override-tensor` can name a device's extra buffer types**
-  (e.g. `CPU_REPACK`), which the argument parser omitted.
-- **Arm Mali (Valhall) OpenCL support**, so `ggml-opencl` stops rejecting the GPU.
-  Enablement only — measured **22× slower than the CPU** on this SoC.
 
 ## Status
 
