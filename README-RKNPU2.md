@@ -160,6 +160,15 @@ Commit `51f3ed6a6`. All figures measured on ROCK 5B+ / 16 GB / driver 0.9.8.
 - **Arm Mali (Valhall) OpenCL support**, so `ggml-opencl` stops rejecting the GPU
   outright. Enablement only: measured 22x slower than the CPU on this SoC.
 
+## Documentation
+
+| document | contents |
+|---|---|
+| [BENCHMARKS.md](BENCHMARKS.md) | full result tables: 14 models, every configuration tried, perplexity, raw NPU matmul sweep, kernel-level MoE figures, platform constants, speculative decoding, and a table of everything that did **not** work |
+| [MULTI-BOARD.md](MULTI-BOARD.md) | distributing a model across boards: three schemes measured, why decode does not improve on 2.5 GbE (with the arithmetic), and the seven fixes needed to make it work at all |
+| [MEMORY-RESIDENCY.md](MEMORY-RESIDENCY.md) | why residency dominates throughput, and the benchmarking trap it creates |
+| [LINEAGE.md](LINEAGE.md) | provenance of every part of this tree, with commands to verify it |
+
 ## Validation
 
 Against the previous base, otherwise-idle board, warm runs only, A/B/A ordering:
