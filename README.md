@@ -35,7 +35,7 @@ which backend interface slots had changed since May, which saved us the search.
 **What we added** is the rebase onto current upstream plus backend engineering —
 MoE experts on the NPU, cross-board tensor parallelism, quantisation fixes and a
 measurement study. Commits [`95a113dc7`](../../commit/95a113dc7) and
-[`51f3ed6a6`](../../commit/51f3ed6a6). Full provenance in **[LINEAGE.md](LINEAGE.md)**.
+[`51f3ed6a6`](../../commit/51f3ed6a6). Full credits in **[CREDITS.md](CREDITS.md)**, full provenance in **[LINEAGE.md](LINEAGE.md)**.
 
 ---
 
@@ -293,6 +293,56 @@ for p in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor \
          /sys/class/devfreq/*/governor; do echo performance | sudo tee $p; done
 ```
 
+## Which GGUF quantisations work on the NPU
+
+**This matters more than anything else when choosing a model file.** The backend
+requantises weights into the NPU's native formats at load, and it can only do that
+for a specific set of GGUF types. Everything else silently falls back to the CPU —
+it will run, but the NPU contributes nothing.
+
+| GGUF type | NPU-eligible | maps to | notes |
+|---|---|---|---|
+| **`Q4_0`** | ✅ | `W4A4_HADAMARD` by default | **run it as int8 instead** — see below |
+| **`Q8_0`** | ✅ | `W8A8_STANDARD` | safest default |
+| **`Q6_K`** | ✅ | alternates int8 / int4 per tensor | half its tensors take the int4 path |
+| **`F16`** | ✅ | `W16A16` | 2× the bytes, no quality gain over int8 in practice |
+| `Q4_K_M`, `Q4_K_S`, `Q3_K`, `Q5_K`, `IQ*` | ❌ | — | **CPU only**; the NPU is unused |
+| `MXFP4` (e.g. native gpt-oss) | ❌ | — | **CPU only** |
+
+### Recommended pairings
+
+| what you have | what to run | why |
+|---|---|---|
+| `Q4_0` | `RKNPU_HYBRID=W8A8_STANDARD` | INT4 does not batch (~120 GFLOPS ceiling, linear in M); int8 reaches **1563 GFLOPS**. Worth **~9.7×** on quantised matmuls. Costs 2× the bytes per weight — accepted, because there is no 4-bit-weight pipeline that keeps activation precision. |
+| `Q8_0` | default (`W8A8_STANDARD`) | already matched |
+| `Q6_K` / `F16` | `W8A8_STANDARD` | feeding a higher-precision file into a lower-precision pipeline gives the requantiser an accurate reference and the best quality of any option |
+| any K-quant | reconsider | works, but on the CPU only. For a **MoE with `--cpu-moe`** this is fine — the experts are CPU-side anyway — and `Q3_K_M` measured ~7.6 t/s on the 30B. |
+
+If you need INT4 on the NPU, set **`RKNPU_PERCHAN=1`**. Per-output-channel scales
+take INT4 attention from **+43 % to +5.0 %** perplexity versus int8; the default
+per-block scales (one scale per ~2.8 M weights) are too coarse for 4-bit and
+produce visibly wrong answers.
+
+### Quantisations measured here
+
+| model | quant | file | PP | TG | coherent |
+|---|---|---|---|---|---|
+| Qwen3-30B-A3B | **Q4_0** | 17.3 GB | **21.1** | **9.6** | ✅ deployed |
+| Qwen3-30B-A3B | Q8_0 | 31 GB | — | 1.2-2.3 | ✅ |
+| Qwen3-30B-A3B | Q3_K_M (CPU only) | 14.7 GB | — | ~7.6 | ✅ |
+| Qwen3.6-35B-A3B | Q4_0 | 20.8 GB | 18.5 | 4.07 | ✅ |
+| Qwen3.6-27B dense | Q8_0 | 28.6 GB | — | 1.05 (3 boards) | ✅ |
+| Qwen3.6-27B dense | Q4_0 | 15.8 GB | — | ~0.5 (I/O bound) | ✅ |
+| gemma-4-12B dense | Q8_0 | 13 GB | — | 1.12-1.54 | ✅ |
+| gemma-4-E4B | Q8_0 | 8.2 GB | 38.2 | 4.04 | ✅ |
+| gemma-3-1B | Q8_0 | 1 GB | 201.6 | 17.0 | ✅ |
+| gpt-oss-120b | Q8_0 | 60 GB | — | 0.88 | ✅ |
+| gpt-oss-20b | MXFP4 (CPU only) | 12 GB | 13.1 | 6.1-8.0 | ❌ incoherent |
+| gpt-oss-20b | Q4_0 requantised | 11.5 GB | 13.7 | 7.5 | ❌ incoherent |
+
+Perplexity across five quantisation and routing configurations is in
+**[BENCHMARKS.md](BENCHMARKS.md)** §5.
+
 ## Results at a glance
 
 16 GB ROCK 5B+, single board unless noted. PP = prefill t/s, TG = decode t/s.
@@ -316,6 +366,7 @@ not work** — in **[BENCHMARKS.md](BENCHMARKS.md)**.
 | **[BENCHMARKS.md](BENCHMARKS.md)** | all result tables, perplexity, raw NPU matmul sweep, platform constants, speculative decoding, and the levers that failed |
 | **[MULTI-BOARD.md](MULTI-BOARD.md)** | distributing a model across boards — 3 schemes with diagrams, why decode does not improve on 2.5 GbE, and the 7 fixes needed to make it work |
 | **[MEMORY-RESIDENCY.md](MEMORY-RESIDENCY.md)** | why residency dominates throughput, and the benchmarking trap it creates |
+| **[CREDITS.md](CREDITS.md)** | who wrote which part, with links |
 | **[LINEAGE.md](LINEAGE.md)** | provenance, with commands to verify every claim |
 | [ggml/src/ggml-rknpu2/README.md](ggml/src/ggml-rknpu2/README.md) | the backend's own documentation, by @invisiofficial |
 | [README-llama.cpp.md](README-llama.cpp.md) | upstream llama.cpp's README |
