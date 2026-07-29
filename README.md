@@ -72,44 +72,147 @@ Available devices:
 `0 MiB` is correct — the backend reports as a compute accelerator with no memory
 of its own, so llama.cpp keeps the KV cache on the host where it belongs.
 
-## Run
+## Running modes — pick one
+
+| mode | when | boards | example result (Qwen3-30B-A3B Q4_0) |
+|---|---|---|---|
+| **A. single board** | model fits RAM | 1 | **PP 21.1 · TG 9.6** ← best overall |
+| **B. single board, larger than RAM** | MoE bigger than RAM | 1 | 60 GB model → TG 0.88 |
+| **C. multi-board serial** (`-sm layer`) | dense model too big; simplest | 2-4 | PP **26.6** · TG 2.5 |
+| **D. multi-board parallel** (`rktp`) | dense model too big; better decode | 2-4 | 27B dense: TG **1.05** vs 0.53 serial |
+
+**If the model fits one board, use mode A.** Measured repeatedly: adding boards to
+a model that already fits does not help (gemma-4-12B: 1 board 1.12-1.54,
+2 boards 1.12, 3 boards 1.29). Only distribute when you must.
+
+### A. Single board
 
 ```bash
 RKNPU_HYBRID=W8A8_STANDARD RKNPU_GLUE=1 \
+ulimit -n 1000000 && \
 taskset -c 4-7 ./build/bin/llama-server -m model.gguf \
-    -ngl 99 -t 4 -fa on --host 0.0.0.0 --port 8080
+    -ngl 99 -t 4 -c 16384 -fa on --host 0.0.0.0 --port 8080
 ```
 
-Set CPU, DRAM and NPU governors to `performance` first — worth **+32 %** and free.
-Pin to the four Cortex-A76 cores: including the A55s **costs 56 %**.
+### B. Single board, MoE larger than RAM
 
-### Models larger than RAM
-
-MoE models several times larger than physical RAM run fine, because only the
-routed experts are read per token:
+Only the routed experts are read per token, so the model may be several times RAM.
 
 ```bash
---cpu-moe --no-repack -fit off
+RKNPU_HYBRID=W8A8_STANDARD RKNPU_GLUE=1 \
+ulimit -n 1000000 && \
+taskset -c 4-7 ./build/bin/llama-server -m big-moe.gguf \
+    -ngl 99 --cpu-moe --no-repack -fit off \
+    -t 4 -c 16384 -fa on --host 0.0.0.0 --port 8080
 ```
 
-- `--no-repack` is **required** — a full repack materialises every expert in RAM.
-- `-fit off` is currently required above free memory: upstream's fit heuristic
-  aborts rather than proceeding, as it does not treat a memory-mapped buffer as
-  reclaimable.
+Add `--override-kv <arch>.expert_used_count=int:4` to halve the experts read per
+token: **+32 % decode, +14.6 % perplexity**. A real trade, not a free win.
 
-Measured on a 16 GB board: a 20.8 GB model loads in 35 s, and a **60 GB model
-runs at 0.88 t/s**.
+### C. Multi-board, serial (layer pipeline)
 
-### Quantisation on this hardware — two things to know
+Boards take turns, one active at a time. Uses upstream `ggml-rpc`.
 
-1. **RK3588 implements only symmetric matmul precisions** — `W16A16`, `W8A8`,
-   `W4A4`. There is no `W8A16`, `W4A16` or `W4A8` (probed against
-   `rknn_matmul_create`), so 4-bit weights cannot pair with higher-precision
-   activations.
-2. **INT4 does not batch**: latency is linear in M, ceiling ~120 GFLOPS. INT8
-   reaches **1563 GFLOPS**. Since `Q4_0` auto-maps to INT4, run it through the
-   int8 pipeline instead — `RKNPU_HYBRID=W8A8_STANDARD`, worth **~9.7× on
-   quantised matmuls**.
+**On each remote board:**
+```bash
+cd rk-llama.cpp
+LD_LIBRARY_PATH=build/bin:ggml/src/ggml-rknpu2/libs \
+RKNPU_AS_GPU=1 ulimit -n 65536 && \
+./build/bin/rpc-server -H 0.0.0.0 -p 50060 -d RKNPU
+```
+
+**On the coordinator:**
+```bash
+RKNPU_AS_GPU=1 RKNPU_HYBRID=W8A8_STANDARD RKNPU_GLUE=1 \
+ulimit -n 1000000 && \
+taskset -c 4-7 ./build/bin/llama-server -m model.gguf \
+    --rpc <boardB>:50060,<boardC>:50060 -sm layer \
+    -ngl 99 -fit off -nkvo -t 4 -c 4096 -fa on --host 0.0.0.0 --port 8080
+```
+
+★ `RKNPU_AS_GPU=1` must be set on **both** the coordinator **and** every
+`rpc-server` — device type and memory are evaluated in the remote process. Without
+it the scheduler gives the remote board no layers and the split silently does
+nothing.
+
+### D. Multi-board, parallel (tensor parallel)
+
+Every board computes part of each matmul simultaneously. Better decode than mode C
+for dense models.
+
+**On each shard board:**
+```bash
+cd rk-llama.cpp
+LD_LIBRARY_PATH=build/bin:ggml/src/ggml-rknpu2/libs \
+RKNPU_HYBRID=W8A8_STANDARD ulimit -n 65536 && \
+./build/bin/tp_shard --role shard --port 48200
+```
+
+**On the coordinator:**
+```bash
+RKNPU_TP_SHARD=<shardA>:48200,<shardB>:48200 \
+RKNPU_TP_MINN=2048 RKNPU_TP_LOCFRAC=0.34 \
+RKNPU_TP_OFFLOAD=0.5 RKNPU_TP_FULLNPU=1 \
+RKNPU_HYBRID=W8A8_STANDARD RKNPU_GLUE=1 \
+ulimit -n 1000000 && \
+taskset -c 4-7 ./build/bin/llama-server -m model.gguf \
+    -ngl 99 -t 4 -c 4096 -fa on --host 0.0.0.0 --port 8080
+```
+
+| variable | meaning |
+|---|---|
+| `RKNPU_TP_SHARD` | comma-separated shard endpoints. One shard = 2 boards, two = 3 boards. |
+| `RKNPU_TP_LOCFRAC` | fraction of output rows kept locally. **0.5 for 2 boards, 0.34 for 3.** |
+| `RKNPU_TP_MINN` | minimum output width to split. 2048 splits most projections. |
+| `RKNPU_TP_OFFLOAD` | fraction of non-splittable tensors shipped whole, for memory balance. |
+| `RKNPU_TP_FULLNPU=1` | keep all weights on the NPU rather than spilling to CPU. |
+
+★ **`RKNPU_TP_LOCFRAC` must land on the backend's alignment boundary.** A value
+like `0.6` produces plausible token rates and **silently wrong output** — it was
+measured at "1.06 t/s" before anyone read the text. Use 0.5 or 0.34.
+
+★ `RKNPU_HYBRID` must be **identical** on coordinator and shards. A coordinator on
+`W8A8_STANDARD` with a shard defaulting `Q4_0` to `W4A4_HADAMARD` aborts on a
+missing Hadamard vector.
+
+★ After changing `tp_shard.cpp` or the wire protocol, rebuild the shard **and
+rsync its ggml libraries** — `tp_shard` is not a CMake target, so `make` will not
+rebuild it, and a fresh binary against stale `libggml-base.so` crashes inside
+`graph_compute`. Use `rebuild_tp_shard.sh`.
+
+**Do not expect decode to improve on 2.5 GbE.** Tensor parallelism offers
+512 FLOP/byte against a ~536 FLOP/byte machine balance, so the link is the binding
+constraint — measured on the 30B: prefill **-15 %**, decode **-23 %** versus a
+single board. It wins on the dense 27B only because that case is latency-bound at
+M=1 and the alternative uses one board at a time. Full arithmetic in
+[MULTI-BOARD.md](MULTI-BOARD.md).
+
+## Flag reference
+
+Flags that matter on this platform, and why.
+
+| flag | effect | notes |
+|---|---|---|
+| `-ngl 99` | offload all layers | the backend takes what it can run |
+| `-t 4` | 4 threads | **never more** — A55 cores cost 56 % |
+| `taskset -c 4-7` | pin to Cortex-A76 | big.LITTLE barrier sync otherwise |
+| `-fa on` | flash attention | large free prefill win; `-fa` off cost 21.1 → 8.2 |
+| `--cpu-moe` | MoE experts on CPU | required for MoE larger than RAM |
+| `--no-repack` | keep experts memory-mapped | **mandatory** with `--cpu-moe` above RAM; a repack materialises every expert in RAM |
+| `-fit off` | skip the memory-fit check | required above free RAM — upstream aborts, not treating mmap as reclaimable |
+| `-nkvo` | KV cache on host | needed with `RKNPU_AS_GPU=1`; not otherwise |
+| `-c N` | context | KV is host-side; 16384 is comfortable on 16 GB |
+| `--override-kv <arch>.expert_used_count=int:N` | fewer experts per token | +32 % decode at +14.6 % perplexity for 8 → 4 |
+| `-ot <regex>=CPU` | force tensors to a buffer type | this fork also allows naming extra bufts, e.g. `CPU_REPACK` |
+| `--jinja` | use the model's chat template | needed for tool-calling models |
+
+**Governors first, always.** `performance` on CPU, DRAM and NPU is worth **+32 %**
+and costs nothing:
+
+```bash
+for p in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor \
+         /sys/class/devfreq/*/governor; do echo performance | sudo tee $p; done
+```
 
 ## Results at a glance
 
