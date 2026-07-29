@@ -485,6 +485,7 @@ ggml_add_backend(WebGPU)
 ggml_add_backend(zDNN)
 ggml_add_backend(OpenCL)
 ggml_add_backend(Hexagon)
+ggml_add_backend(RKNPU2)
 ggml_add_backend(ZenDNN)
 ggml_add_backend(OPENVINO)
 
