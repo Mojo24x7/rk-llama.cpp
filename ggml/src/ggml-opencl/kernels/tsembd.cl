@@ -1,3 +1,4 @@
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 kernel void kernel_timestep_embedding(
     global const void * p_timesteps,
     ulong off_timesteps,

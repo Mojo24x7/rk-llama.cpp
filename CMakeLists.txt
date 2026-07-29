@@ -127,6 +127,7 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_SUBPROCESS "llama-common: use subprocess, required by server tools and server router mode" ${LLAMA_SUBPROCESS_DEFAULT})
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
+option(LLAMA_RKNPU2     "llama: use Rockchip NPU" OFF)
 
 
 # Required for relocatable CMake package
@@ -180,6 +181,10 @@ llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
 license_add_file("llama.cpp" "LICENSE")
+
+if (LLAMA_RKNPU2)
+    set(GGML_RKNPU2 ON)
+endif()
 
 #
 # 3rd-party

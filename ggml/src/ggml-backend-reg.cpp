@@ -90,6 +90,10 @@
 #include "ggml-et.h"
 #endif
 
+#ifdef GGML_USE_RKNPU2
+#include "ggml-rknpu2.h"
+#endif
+
 namespace fs = std::filesystem;
 
 static std::string path_str(const fs::path & path) {
@@ -170,6 +174,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
+#endif
+#ifdef GGML_USE_RKNPU2
+        register_backend(ggml_backend_rknpu2_reg());
 #endif
     }
 

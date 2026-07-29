@@ -7122,6 +7122,7 @@ static void ggml_vk_instance_init() {
     if (debug_utils_ext) {
         extensions.push_back("VK_EXT_debug_utils");
     }
+#if defined(VK_HEADER_VERSION) && VK_HEADER_VERSION >= 272
     VkBool32 enable_best_practice = layer_settings;
     std::vector<vk::LayerSettingEXT> settings = {
         {
@@ -7134,6 +7135,11 @@ static void ggml_vk_instance_init() {
     };
     vk::LayerSettingsCreateInfoEXT layer_setting_info(settings);
     vk::InstanceCreateInfo instance_create_info(vk::InstanceCreateFlags{}, &app_info, layers, extensions, &layer_setting_info);
+#else
+    // VK_EXT_layer_settings needs headers >= 1.3.272; omit on older SDKs so the
+    // build matches the system Vulkan loader (avoids NULL dispatch entry points).
+    vk::InstanceCreateInfo instance_create_info(vk::InstanceCreateFlags{}, &app_info, layers, extensions);
+#endif
 #ifdef __APPLE__
     if (portability_enumeration_ext) {
         instance_create_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
