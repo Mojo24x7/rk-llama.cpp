@@ -3,8 +3,13 @@
 Run local LLMs on the NPU of an RK3588 board (Radxa ROCK 5B+, Orange Pi 5, etc.),
 using current upstream llama.cpp.
 
-Branch **`rknpu2`** = [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-master + 4 commits.
+A fork of **[invisiofficial/rk-llama.cpp](https://github.com/invisiofficial/rk-llama.cpp)**,
+where the RKNPU2 backend was written.
+
+| branch | contents |
+|---|---|
+| `rknpu2` | **their original 12 commits, untouched** |
+| `rknpu2-current` *(default)* | current [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) master + the backend + our work |
 
 ---
 
@@ -21,10 +26,11 @@ with contributions from
 12 commits, 2025-10-17 to 2026-05-19. **Upstream llama.cpp has no Rockchip NPU
 backend at all** — without their work none of this exists.
 
-It is vendored here in commit
+**Their original branch is preserved in this repository as `rknpu2`** — run
+`git log rknpu2` and you get their 12 commits with their names and dates,
+unmodified. On the default branch the backend is vendored in commit
 [`c180473d4`](../../commit/c180473d4), authored to Invisi with `Co-authored-by:`
-trailers for the others, so `git blame` on the backend points at them and not at
-us.
+trailers for the others, so `git blame` points at them and not at us.
 
 **[@danielferr85](https://github.com/danielferr85)** independently rebased the
 same backend onto llama.cpp of 2026-07-14 in

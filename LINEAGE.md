@@ -16,8 +16,10 @@ invisiofficial/rk-llama.cpp           Where RK3588 NPU support was written.
                                       Gerald Tan and Martino Mensio.
         |
         v
-Mojo24x7/rk-llama.cpp                 This repository.
-   branch rknpu2                      = current ggml-org/llama.cpp master
+Mojo24x7/rk-llama.cpp                 This repository - a fork of
+                                      invisiofficial/rk-llama.cpp.
+   branch rknpu2                      THEIR 12 commits, untouched.
+   branch rknpu2-current  (default)   current ggml-org/llama.cpp master
                                       + that backend, vendored with attribution
                                       + our engineering on top.
 ```
@@ -39,21 +41,24 @@ $ git grep -c rknpu origin/master -- ggml/src/CMakeLists.txt ggml/src/ggml-backe
 0
 ```
 
-**This branch sits directly on upstream master, nothing in between.**
+**Branch `rknpu2` is their original work, unmodified.** `git log rknpu2` shows
+all 12 commits with their five authors and real dates.
+
+**Branch `rknpu2-current` sits directly on upstream master, nothing in between.**
 
 ```console
-$ git merge-base rknpu2 origin/master
+$ git merge-base rknpu2-current origin/master
 f5b9bd39b56c7a7839a9795a100b6a00b84ac961
 $ git rev-parse origin/master
 f5b9bd39b56c7a7839a9795a100b6a00b84ac961     # identical
-$ git rev-list --count origin/master..rknpu2
-3
+$ git rev-list --count origin/master..rknpu2-current
+10
 ```
 
 **The backend is credited to its authors in git itself.**
 
 ```console
-$ git log --format='%h %an <%ae>  %s' -- ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
+$ git log --format='%h %an <%ae>  %s' rknpu2-current -- ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
 51f3ed6a6 homelab <lab@rocklabs>              rknpu2: RK3588 NPU backend work from the Rocklabs lab
 95a113dc7 homelab <lab@rocklabs>              ggml-rknpu2: wire the vendored backend into build and ABI
 c180473d4 Invisi <invisiofficial@gmail.com>   ggml-rknpu2: vendor the RK3588 NPU backend from invisiofficial
@@ -97,15 +102,21 @@ work is not in our history and was never fetched, but commit `71fa525e` there is
 what identified which backend vtable slots had changed since May, which saved us
 the search. Credit where due.
 
-## Why a fork of ggml-org/llama.cpp rather than of invisiofficial
+## Repository structure
 
-GitHub renders a fork's diff and network relative to its parent. Forking
-upstream makes this branch read as **three commits on current master**, which is
-what it is. Forking `invisiofficial` would have made it read as ~1500 commits of
-upstream churn against a branch last updated 2026-05-20, burying both their work
-and ours.
+This is a **fork of invisiofficial/rk-llama.cpp**, so GitHub names them as the
+parent and this repository appears in their fork list.
 
-The technical base and the credit are therefore kept separate on purpose: the
-fork parent reflects what the code is built on, and authorship in `git log` and
-`git blame` reflects who wrote it. The second of those is the one that survives
-cloning, bisecting and blaming.
+| branch | contents |
+|---|---|
+| `rknpu2` | **their original 12 commits, untouched.** `git log rknpu2` shows Invisi, Polarnik, hvalev, Gerald Tan and Martino Mensio with their real dates. |
+| `rknpu2-current` *(default)* | current `ggml-org/llama.cpp` master + the backend vendored with attribution + our work. |
+
+Credit therefore appears in four independent places: the fork parent on GitHub,
+their untouched branch in this repository, the author field of the vendoring
+commit, and `git blame` on every line of the backend.
+
+`rknpu2-current` is built on upstream master rather than on their branch because
+their branch was last updated 2026-05-20, and rebuilding on current upstream is
+the entire purpose of this fork. Their history is preserved beside ours rather
+than replaced by it.
