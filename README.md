@@ -126,13 +126,64 @@ git fetch origin && git rebase origin/master
 cd build && make -j3
 ```
 
-## Build
+## Quick start
+
+From a fresh RK3588 board to a running server.
+
+### 1. Prerequisites
+
+| requirement | check | notes |
+|---|---|---|
+| RK3588 board | — | ROCK 5B+, Orange Pi 5/5 Plus, and similar |
+| 64-bit Linux | `uname -m` → `aarch64` | tested on Debian 12, kernel 6.1.84 |
+| **RKNPU kernel driver** | `sudo cat /sys/kernel/debug/rknpu/version` → `v0.9.8` | ships with the vendor kernel; **not** mainline |
+| NPU device access | `ls -l /dev/dri/` | your user must be in the **`video`** group |
+| build tools | `cmake --version`, `g++ --version` | cmake ≥ 3.14, g++ ≥ 10 |
+
+```bash
+sudo apt update && sudo apt install -y git build-essential cmake
+sudo usermod -aG video,render $USER    # log out and back in if you were not already a member
+```
+
+`librknnrt.so` is **bundled in this repository** (`ggml/src/ggml-rknpu2/libs/`) —
+there is nothing else to install.
+
+If `/sys/kernel/debug/rknpu/version` does not exist, your kernel has no RKNPU
+driver and this backend cannot work. That is a kernel/BSP matter, not a build
+option — use a vendor kernel image for your board.
+
+### 2. Clone
+
+```bash
+git clone -b rknpu2-current --depth 1 \
+    https://github.com/Mojo24x7/rk-llama.cpp
+cd rk-llama.cpp
+```
+
+`--depth 1` keeps it to a few hundred MB; the full llama.cpp history is large. Drop
+it if you intend to rebase onto upstream yourself.
+
+Branches: **`rknpu2-current`** is this work (default). **`rknpu2`** is
+invisiofficial's original 12 commits, untouched.
+
+### 3. Build
 
 ```bash
 cmake -B build -DLLAMA_RKNPU2=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
 make -C build -j3 llama-server llama-cli
-ulimit -n 1000000          # each resident matmul context holds DMA handles
 ```
+
+Roughly 7 minutes on a ROCK 5B+ with `-j3`. Use `-j4` if nothing else is running.
+Look for this line in the cmake output:
+
+```
+-- Including RKNPU2 backend
+```
+
+If it is absent, `-DLLAMA_RKNPU2=ON` did not take and you have built a plain
+CPU llama.cpp.
+
+### 4. Verify the NPU is present
 
 ```console
 $ ./build/bin/llama-cli --list-devices
@@ -140,8 +191,57 @@ Available devices:
   RKNPU: Rockchip NPU (0 MiB, 0 MiB free)
 ```
 
-`0 MiB` is correct — the backend reports as a compute accelerator with no memory
-of its own, so llama.cpp keeps the KV cache on the host where it belongs.
+`0 MiB` is **correct** — the backend reports as a compute accelerator with no
+memory of its own, so llama.cpp keeps the KV cache on the host where it belongs.
+If `RKNPU` is missing entirely, see [Troubleshooting](#troubleshooting).
+
+### 5. Get a model
+
+Use a quantisation the NPU can actually use — **`Q4_0`, `Q8_0`, `Q6_K` or `F16`**.
+K-quants and MXFP4 run on the CPU only (see
+[Which GGUF quantisations work on the NPU](#which-gguf-quantisations-work-on-the-npu)).
+
+```bash
+pip install -U "huggingface_hub[hf_transfer]"
+
+# small, to prove the setup works (~1 GB)
+hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q8_0.gguf --local-dir ~/gguf
+
+# the model these benchmarks are based on (~17 GB)
+hf download unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF \
+    Qwen3-30B-A3B-Instruct-2507-Q4_0.gguf --local-dir ~/gguf
+```
+
+### 6. Set the governors — do not skip this
+
+Worth **+32 %** and free. Resets on reboot.
+
+```bash
+for p in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor \
+         /sys/class/devfreq/*/governor; do
+    echo performance | sudo tee $p > /dev/null
+done
+```
+
+### 7. Run
+
+```bash
+ulimit -n 1000000        # each resident matmul context holds DMA handles
+
+RKNPU_HYBRID=W8A8_STANDARD RKNPU_GLUE=1 \
+taskset -c 4-7 ./build/bin/llama-server \
+    -m ~/gguf/gemma-3-1b-it-Q8_0.gguf \
+    -ngl 99 -t 4 -c 4096 -fa on \
+    --host 0.0.0.0 --port 8080
+```
+
+```bash
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":32}'
+```
+
+For a model larger than RAM, add `--cpu-moe --no-repack -fit off` — see
+[Running modes](#running-modes--four-all-measured) mode B.
 
 ## Running modes — four, all measured
 
@@ -348,6 +448,28 @@ produce visibly wrong answers.
 
 Perplexity across five quantisation and routing configurations is in
 **[BENCHMARKS.md](BENCHMARKS.md)** §5.
+
+## Troubleshooting
+
+| symptom | cause | fix |
+|---|---|---|
+| `RKNPU` missing from `--list-devices` | built without the backend | check for `-- Including RKNPU2 backend` in cmake output; rebuild with `-DLLAMA_RKNPU2=ON` |
+| same, but it built fine | no driver, or no permission | `sudo cat /sys/kernel/debug/rknpu/version`; confirm you are in the `video` group (`id -nG`) |
+| `Too many open files` / crash while loading | fd limit | `ulimit -n 1000000` **before** launching |
+| `unable to fit model into system memory by reducing context, abort` | model bigger than free RAM | add **`-fit off`** — a memory-mapped model does not need to fit, but upstream's check assumes it does |
+| killed by the OOM killer on a large MoE | repack materialised every expert in RAM | add **`--no-repack`** alongside `--cpu-moe` |
+| loads, but NPU stays idle and it is slow | K-quant / IQ-quant / MXFP4 file — CPU only | use `Q4_0`, `Q8_0`, `Q6_K` or `F16` |
+| slower than the tables here | governors, threads, or attention | set `performance` governors; use `-t 4` with `taskset -c 4-7` (more threads **cost 56 %**); add `-fa on` |
+| `Q4_0` model slower than expected | it mapped to the INT4 pipeline, which does not batch | set `RKNPU_HYBRID=W8A8_STANDARD` — worth ~9.7× on quantised matmuls |
+| first request far slower than later ones | cold page cache on a model larger than RAM | expected; discard the first run when benchmarking. See [MEMORY-RESIDENCY.md](MEMORY-RESIDENCY.md) |
+| gibberish from a multi-board run | `RKNPU_TP_LOCFRAC` off the alignment boundary | use **0.5** for 2 boards, **0.34** for 3 |
+| shard aborts on a missing Hadamard vector | `RKNPU_HYBRID` differs between nodes | set it **identically** on coordinator and every shard |
+| multi-board split appears to do nothing | `RKNPU_AS_GPU` not set on the remotes | set `RKNPU_AS_GPU=1` on **every** `rpc-server`, not only the coordinator |
+| shard crashes inside `graph_compute` | stale `tp_shard` — it is not a CMake target | run `./rebuild_tp_shard.sh` and rsync its ggml libraries to the shard |
+
+Coherence is worth checking explicitly, not assumed: during this work three
+separate bugs produced **plausible token rates with wrong output**. Always read
+what the model actually wrote.
 
 ## Results at a glance
 
