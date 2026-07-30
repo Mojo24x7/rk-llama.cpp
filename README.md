@@ -8,8 +8,27 @@ where the RKNPU2 backend was written.
 
 | branch | contents |
 |---|---|
-| `rknpu2` | **their original 12 commits, untouched** |
-| `rknpu2-current` *(default)* | current [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) master + the backend + our work |
+| `rknpu2-original` | **their original 12 commits, untouched** — `git log rknpu2-original` |
+| `rknpu2-current` *(default)* | current [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) master + the backend + our work. **This is what you get when you clone.** |
+| `rknpu2` | their 12 commits + our 18 authored commits, on their May 2026 base. Superseded by `rknpu2-current`, kept for the authored history and as a rollback target. **Also the only branch carrying the Arm Mali OpenCL enablement** (see below). |
+| `rknpu2-lineage` | reference marker at the same commit as `rknpu2` |
+| `rknpu2-next` | an earlier single-squashed-commit port onto upstream master; superseded by `rknpu2-current` |
+| `master` | plain upstream mirror, no RK3588 work |
+
+Everything needed to build and run on RK3588 is on the default branch: the
+RKNPU2 backend and its vendored `librknnrt.so`, cross-board tensor parallelism
+(`rktp.h`, `tp_shard.cpp`), `LLAMA_RECURRENT_ON_CPU`, the `-ot` extra-buffer-type
+patch, the RPC fast path, NextN/MTP loading, and all documentation.
+
+**One exception.** The Arm Mali (Valhall) OpenCL enablement is only on `rknpu2`.
+It does not cherry-pick cleanly onto current upstream — `ggml-opencl.cpp` has
+moved substantially — and we did not port it forward because the measurement did
+not justify it: once enabled, Mali is **22-32x slower than the CPU** on this SoC
+and the ceiling for CPU+GPU collaboration is +3.1%. The patch is still useful to
+anyone wanting Mali OpenCL working at all, since two of its five changes are
+genuine bugs any Mali user hits (the kernels detect GPU family from vendor
+extensions Mali does not expose, and three kernels use `half` without enabling
+`cl_khr_fp16`). See `git log rknpu2 -1 b41a02af0` and BENCHMARKS.md.
 
 ---
 
@@ -26,9 +45,11 @@ with contributions from
 12 commits, 2025-10-17 to 2026-05-19. **Upstream llama.cpp has no Rockchip NPU
 backend at all** — without their work none of this exists.
 
-**Their original branch is preserved in this repository as `rknpu2`** — run
-`git log rknpu2` and you get their 12 commits with their names and dates,
-unmodified. On the default branch the backend is vendored in commit
+**Their original branch is preserved in this repository as `rknpu2-original`** —
+run `git log rknpu2-original` and you get their 12 commits with their names and
+dates, unmodified. (Until 2026-07-30 that branch was named `rknpu2`; our own
+commits were then pushed on top of it, so the pristine history was moved to
+`rknpu2-original` to keep it genuinely untouched.) On the default branch the backend is vendored in commit
 [`c180473d4`](../../commit/c180473d4), authored to Invisi with `Co-authored-by:`
 trailers for the others, so `git blame` points at them and not at us.
 
