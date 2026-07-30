@@ -267,3 +267,61 @@ maintainability, not speed.
 - Two of our own published numbers were retracted after re-measurement: an
   NPU-bandwidth figure taken on too small a matrix, and a "+37% from disabling
   glue" result that was a cache-ordering artifact.
+
+---
+
+## 10. Flash attention is depth-dependent on this backend
+
+`-fa on` fuses attention into a single `FLASH_ATTN_EXT` node; `-fa off`
+decomposes it into KQ, softmax and KQV. With `-nkvo` gone and the KV cache on
+the host CPU, which of the two is faster **depends on context depth**, and the
+two effects pull in opposite directions.
+
+Qwen3-30B-A3B-Q4_0, top-4 routing, `--spec-type none` (so prompt-lookup cannot
+contaminate the result), prompts built from non-repetitive prose verified to
+contain zero repeated 8-grams, `n_predict = 128` fixed at every depth. All four
+depths were swept **inside each server process** so they share one page-cache
+state; the `-fa on` column is the mean of two legs measured before and after the
+`-fa off` leg, and per-depth drift between them was under 1 %.
+
+| prompt tokens | PP `-fa on` | PP `-fa off` | ΔPP | TG `-fa on` | TG `-fa off` | ΔTG |
+|---|---|---|---|---|---|---|
+| 275  | 28.18 | 25.02 | **-11.2 %** | 7.99 | 8.00 | +0.1 % |
+| 514  | 28.06 | 25.49 | **-9.2 %**  | 7.43 | 7.43 | 0.0 % |
+| 997  | 25.44 | 23.48 | -7.7 %      | 6.25 | 6.72 | **+7.5 %** |
+| 1574 | 21.84 | 21.52 | -1.5 %      | 4.94 | 6.05 | **+22.5 %** |
+
+Graph splits: **483** with flash attention, **579** without — and the slower
+configuration at depth is the one with *fewer* splits, so split count is not the
+cost here. The KV and RKNPU buffer sizes are identical in both states.
+
+**The decode benefit grows with depth and the prefill cost shrinks with it.**
+The fused CPU kernel only loses once the KV cache is large; below about 500
+tokens the two paths are indistinguishable in decode while `-fa off` still pays
+9-11 % of prefill for nothing.
+
+Break-even answer length, computed per depth from the measured `prompt_ms` and
+`predicted_ms`:
+
+| prompt tokens | prefill penalty of `-fa off` | decode saving | break-even answer |
+|---|---|---|---|
+| 275  | 1.25 s | 0.3 ms/tok  | ~4160 tokens — never pays |
+| 514  | 1.84 s | 0.4 ms/tok  | ~4600 tokens — never pays |
+| 997  | 3.29 s | 10.8 ms/tok | ~305 tokens |
+| 1574 | 1.06 s | 37.9 ms/tok | ~28 tokens — pays almost always |
+
+**Rule of thumb: `-fa off` is right above roughly 1000 prompt tokens and wrong
+below roughly 500.** For a 200-token answer, short chat at 275 input tokens is
+4 % faster with `-fa on`, while a retrieval request at 1574 input tokens is 6 %
+faster with `-fa off`. Neither dominates; pick for the traffic that hurts.
+
+A single break-even figure cannot be extrapolated from two depths. An earlier
+version of this measurement used only 9 and 1689 tokens and reported
+"break-even at about 92 output tokens" as if the relationship were
+depth-independent. It is not, and that figure is withdrawn.
+
+**Context decay is mostly not flash attention.** Decode falls from 7.99 to 4.94
+t/s between 275 and 1574 tokens with `-fa on` (-38 %), and still falls from 8.00
+to 6.05 (-24 %) with `-fa off`. Most of the decay survives removing flash
+attention entirely, which is consistent with page-cache behaviour on a model
+larger than RAM being a co-factor of comparable size (see `MEMORY-RESIDENCY.md`).

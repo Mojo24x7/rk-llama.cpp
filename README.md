@@ -499,6 +499,7 @@ not work** — in **[BENCHMARKS.md](BENCHMARKS.md)**.
 | **[BENCHMARKS.md](BENCHMARKS.md)** | all result tables, perplexity, raw NPU matmul sweep, platform constants, speculative decoding, and the levers that failed |
 | **[MULTI-BOARD.md](MULTI-BOARD.md)** | distributing a model across boards — 3 schemes with diagrams, why decode does not improve on 2.5 GbE, and the 7 fixes needed to make it work |
 | **[MEMORY-RESIDENCY.md](MEMORY-RESIDENCY.md)** | why residency dominates throughput, and the benchmarking trap it creates |
+| **[SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md)** | prompt-lookup vs draft models vs MTP on a sparse MoE, why `--spec-ngram-size-n` is tuned by your traffic rather than your model, flash-attention depth curve, and a server-crashing bug in two `ngram-map` variants |
 | **[CREDITS.md](CREDITS.md)** | who wrote which part, with links |
 | **[LINEAGE.md](LINEAGE.md)** | provenance, with commands to verify every claim |
 | [ggml/src/ggml-rknpu2/README.md](ggml/src/ggml-rknpu2/README.md) | the backend's own documentation, by @invisiofficial |

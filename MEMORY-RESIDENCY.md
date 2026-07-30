@@ -127,9 +127,10 @@ conclusions:
 1. **No controlled 16 GB versus 32 GB comparison exists.** Section 1 infers the
    resident case from the same board's warm-cache behaviour, which is sound but
    is not the same as measuring a board that can hold the model outright. The
-   RKNPU2 backend's own published reference figures were produced on a 32 GB
-   board, so for the larger models they are not reproducible on 16 GB hardware -
-   a gap in the ecosystem's documentation rather than in the backend.
+   RKNPU2 backend's own published reference tables do not state how much memory
+   the measurements used, so whether the larger models there are reproducible on
+   16 GB hardware cannot be determined from them - a gap in the ecosystem's
+   documentation rather than in the backend.
 2. **The backend allocates NPU memory across IOMMU domains** with a per-domain
    limit of roughly 4 GB, striping as needed. How addressable resident capacity
    scales with physical RAM across domains has not been characterised.
@@ -139,3 +140,79 @@ conclusions:
    that trade changes when each board holds a resident model is untested.
 
 Working notes and reproduction scripts: this repository, branch `rknpu2`.
+
+---
+
+## Readahead cannot help MoE expert paging
+
+A natural idea for a model larger than RAM is to widen the kernel's readahead
+window, since an O_DIRECT profile of the same NVMe device shows a large
+granularity gap:
+
+```
+seq 8M  1.576 GB/s | rnd 4M 1.523 GB/s | rnd 64K 0.339 GB/s | rnd 4K 0.037 GB/s
+read_ahead_kb = 128 (default)   page size = 4096
+```
+
+Cold faults therefore arrive in the 0.339 GB/s regime while the device can
+sustain 1.5 GB/s at megabyte granularity, and expert slices are contiguous
+(the expert index is the `ne[2]` dimension) at roughly 0.9 MB per tensor. That
+argues for a 4x headroom.
+
+**It does not exist.** Measured per value: set `read_ahead_kb`, drop caches, load
+the model, then five *distinct* prompts so routing reaches genuinely uncached
+experts. Bytes read are taken from `/proc/diskstats` around each request. Order
+128 -> 512 -> 1024 -> 2048 -> 128 with the baseline re-measured last (drift
+-1.4 %). Model Qwen3-30B-A3B-Q4_0, 16.04 GiB against about 11.8 GiB of usable
+page cache.
+
+| `read_ahead_kb` | decode t/s | NVMe MB per token | bytes vs default |
+|---|---|---|---|
+| **128** (default) | **7.35** | **11.37** | 1.00x |
+| 512  | 7.48 (+2.5 %) | 16.45 | 1.45x |
+| 1024 | 7.15 (-2.1 %) | 24.22 | 2.13x |
+| 2048 | 6.83 (-6.4 %) | 33.84 | 2.98x |
+
+Percentages are against the drift-corrected baseline of 7.30 t/s.
+
+**Widening readahead fetches more bytes, not the same bytes faster.** Traffic
+grew 1.45x, 2.13x and 2.98x as the window grew 4x, 8x and 16x. Readahead is a
+sequential-access optimisation, and MoE expert paging is not sequential access:
+the router selects 4 of 128 experts per layer per token at runtime, so the pages
+adjacent to a needed slice usually belong to experts this token will not touch.
+The granularity gap is real, but it is reachable only for a **dense** model,
+which reads every weight every token and therefore streams sequentially — that
+case was separately measured at 987 MB/s sustained with the CPU only 33 % busy.
+
+512 kB is marginally positive because at that size the extra bytes are nearly
+free in time, so a 45 % traffic increase costs almost nothing while occasionally
+prefetching a useful neighbour. By 1024 kB the wasted bytes dominate. We did not
+adopt 512 kB: +2.5 % is within the noise band of this platform, it was measured
+in the worst case with caches deliberately dropped, and it costs 45 % more device
+traffic permanently.
+
+This also gives a curve for the earlier one-point observation that a very large
+readahead hurt: the damage is monotonic above roughly 512 kB.
+
+## Which pages are resident matters more than how many
+
+Two measurements of the *same* server configuration on the *same* board differed
+by 11 % (9.75 versus 8.72 t/s) for a byte-identical workload, with flags, thread
+count and CPU affinity verified identical from `/proc/<pid>/cmdline` and
+`taskset -pc`. The slower measurement was the one with the **higher** resident
+fraction (57 % of the 16.04 GiB mapping).
+
+The faster measurement came from a sweep that ran five server processes over the
+same seven prompts, so by the third configuration those specific experts had been
+faulted in about fourteen times and the page cache had converged on that exact
+prompt mix. Per-prompt decode across those seven prompts ranged from 6.83 to
+10.55 t/s.
+
+Two consequences for anyone benchmarking a model larger than RAM. Residency
+percentage is a weak predictor; the useful question is whether the resident set
+matches the routing of the prompt being served. And a benchmark that reuses one
+prompt set across configurations silently optimises the cache for that set, which
+inflates every absolute number in the sweep while leaving the relative ordering
+intact. Repeated passes over a varied prompt set do not converge: passes 2 and 3
+measured 7.78 and 7.77 t/s while each still read 6.6 to 7.0 GB from NVMe, because
+the prompts' expert sets evict one another.
