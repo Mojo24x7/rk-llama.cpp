@@ -325,3 +325,77 @@ t/s between 275 and 1574 tokens with `-fa on` (-38 %), and still falls from 8.00
 to 6.05 (-24 %) with `-fa off`. Most of the decay survives removing flash
 attention entirely, which is consistent with page-cache behaviour on a model
 larger than RAM being a co-factor of comparable size (see `MEMORY-RESIDENCY.md`).
+
+---
+
+## Quantisation and the NPU eligibility boundary (2026-07-30)
+
+The single most useful rule we have found for this backend, because it decides
+whether a quantisation change buys anything at all.
+
+`RKNPU_HYBRID=W8A8_STANDARD` reads **every NPU-resident weight as int8**
+(1.0625 B/param) whatever the GGUF stores, because RK3588's matmul requires
+symmetric A/B precision — `W8A4` and `W16A4` are rejected by the driver. The
+NPU-eligible types are **F16 / Q8_0 / Q6_K / Q4_0**.
+
+> **A quantisation change only reduces decode bytes if it crosses the eligibility
+> boundary.** Q8_0 → Q6_K → Q4_0 are all free of charge in bytes-read terms on an
+> NPU-resident tensor: all three become int8. The saving only appears with
+> `Q3_K` / `Q4_K` / `Q5_K` / `IQ*`, which the backend will not claim, so the
+> tensor stays on the CPU and is read at its real precision.
+
+This explains four otherwise puzzling results:
+
+| change | crosses boundary? | measured decode |
+|---|---|---|
+| dense projections Q8_0 → **q4_K** (35B) | yes | +5 % |
+| dense projections Q8_0 → **Q4_0** (35B) + batch-aware placement | no (Q4_0 is eligible) | +2.3 %, inside noise |
+| smaller published 35B quants (dense → **Q6_K**) | no | ~0 expected; not worth the quality |
+| 30B **Q4_0 → Q3_K_M** | yes | **+27 %** |
+
+### Fitting in RAM: 30B Q4_0 vs Q3_K_M
+
+Same model, same flags, distinct prompts, drift −0.8 %:
+
+| config | file | RKNPU pinned | graph splits | decode | perplexity |
+|---|---|---|---|---|---|
+| Q4_0 (output tensor Q4_0) | 16.04 GiB | 1328 MiB | 579 | 7.52 t/s | 4.0619 ± 0.317 |
+| **Q3_K_M** | **13.70 GiB** | **425 MiB** | **387** | **9.56 t/s** | **4.0320 ± 0.310** |
+
+**+27 % decode at equal quality** — the 3-bit k-quant is marginally *better* on
+perplexity, well inside the error bars. Q4_0 is a legacy format (4.5 bpw, one
+scale per 32 weights, no grouping); Q3_K_M is a k-quant at ~3.9 bpw effective with
+better scaling plus llama.cpp's mixture heuristics protecting important tensors.
+
+Three effects compound here: Q3_K is not NPU-eligible so attention leaves the NPU
+(1328 → 425 MiB pinned) and is read at ~0.43 B/param instead of int8's 1.0625;
+device handoffs drop by a third; and the smaller mapping improves residency
+(15.6 GB vs 18.9 GB against ~15 GB usable).
+
+> If you run a 30B-class MoE on this hardware, **prefer a k-quant to Q4_0.**
+
+`--no-mmap` with full repack sizes correctly (`CPU 8154 + CPU_REPACK 5499 +
+RKNPU 425` = 14.1 GB, + 768 MiB KV at `-c 8192`) but is still SIGKILLed during
+load: the load peak exceeds the steady state and a repack allocation gets no swap
+relief.
+
+## What does NOT help decode on RK3588 (all measured, drift-controlled)
+
+Recorded so others do not spend the time. Model: Qwen3.6-35B-A3B, 16 GB board.
+
+| lever | result | why |
+|---|---|---|
+| Faster / additional storage | **≤14 % ceiling, 4 % utilised** | decode reads 13 MB/token at 61 MB/s mean against a 1542 MB/s device; 34 KiB requests at queue depth 1-2. Latency-shaped, not bandwidth-shaped |
+| More CPU threads | `-t 5` **−25 %**, `-t 6` −34 %, `-t 8` −42 % | all pinned to the same 4 A76s. Total CPU seconds *rise* while throughput falls: barrier serialisation, not stalls |
+| Op fusion | **0 %** | `ggml-cpu` already fuses RMS_NORM+MUL; disabling it via `GGML_CPU_DISABLE_FUSION=1` changes decode by +1 %. Removing ~10 % of graph nodes is worth nothing, so node count is not the driver |
+| MTP speculative decoding | **−8 %** (n-max 1), **−14.6 %** (n-max 2) | on a sparse MoE a batched verify activates the *union* of experts across drafted positions, so each drafted token makes the target read more |
+| Batch-aware NPU/CPU placement | +2.3 %, inside noise | and it moves work from the ~4.2 W NPU to the ~7.2 W CPU, so J/token worsens |
+| `-ot <pattern>=CPU` to force a tensor off the NPU | does not work | `=CPU` re-enters buffer-type selection rather than pinning placement, and selection re-claims the tensor for RKNPU. Use a non-eligible GGUF type instead |
+
+Decode on this model is **not limited by any bandwidth**. Three independent byte
+reductions (−14 %, −28 %, and the whole I/O axis) each returned 2-5 %. Parallel
+efficiency is 46 % with 54 % of the pinned A76 capacity idle, and the profile
+catches the main thread inside the NPU backend in 37 % of samples while the CPU
+workers wait — a serial device handoff, which fusion cannot touch and which
+overlapping cannot fix either, since the two engines share LPDDR (27.3 GB/s
+concurrent vs 23 alone).

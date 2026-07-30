@@ -79,12 +79,38 @@ discarded. Full tables in **[BENCHMARKS.md](BENCHMARKS.md)**.
 | **Correct device type + KV placement** (gemma-3-1B decode) | 2.39 t/s | **17.32 t/s** | **7.2×** |
 | **`ggml-rpc` weight transfer** | 38 MB/s | **280 MB/s** (wire-limited) | **7.4×** |
 | **Production 30B prefill** | 8.66 t/s | **21.1 t/s** | **2.4×** |
-| **Hybrid model decode** (Qwen3.6-35B, fused GDN kept alive) | 4.35 t/s | **7.99 t/s** | **+84 %** |
+| **Hybrid model decode** (Qwen3.6-35B, fused GDN kept alive) | GDN silently disabled | **GDN enabled** | mandatory — [see note](#withdrawn-figure) |
 | **Tensor parallel vs layer pipeline** (27B dense, 3 boards) | 0.53 t/s | **1.05 t/s** | **2.0×** |
 | **INT4 attention quality** (per-channel scales) | +43 % perplexity | **+5.0 %** | **8.6× less loss** |
 | **Inter-device traffic** (glue-op locality) | 13.9 GB/req | **3.3 GB/req** | **4.2× less** |
 | **Production 30B decode** | 6.5 t/s | **9.6 t/s** | **1.5×** |
 | **Governor tuning alone** | — | — | **+32 %** |
+
+<a name="withdrawn-figure"></a>
+> **Withdrawn figure — hybrid model decode.** An earlier version of this table
+> reported this row as `4.35 t/s → 7.99 t/s (+84 %)`. Those figures were measured
+> with a harness that reused a single prompt. On a model larger than board RAM
+> that keeps the routed experts resident in page cache and **inflates decode by
+> 40-70 %** — measured on 2026-07-30 at 8.54 and 7.31 t/s on repeated prompts
+> versus 5.0-5.1 t/s on distinct ones.
+>
+> A controlled re-test (same tree, same GGUF, same `-c 4096`, distinct prompts,
+> drift −1.4 % across six samples) gives **5.62 t/s**, not 7.99. The deployed
+> model measures **5.0-5.3 t/s** at short context, **4.0** at 280 prompt tokens
+> and **3.7** at 1900.
+>
+> What still stands is the mechanism, and it is verifiable from the load log
+> rather than from a benchmark: without `LLAMA_RECURRENT_ON_CPU=1` **both fused
+> Gated Delta Net paths silently disable**, because the fused op falls to the CPU
+> backend while its layer is assigned to the NPU and the resolver requires them to
+> agree. Always grep the load log for
+> `fused Gated Delta Net (autoregressive) enabled`. The size of the win has not
+> been re-measured under the corrected methodology, so no ratio is quoted.
+>
+> **Read every decode figure in this repository with that caveat**: any number
+> whose harness cannot be shown to use distinct prompts is an upper bound, not a
+> measurement. Perplexity is unaffected — it is deterministic, and our stored
+> figures reproduce bit-for-bit.
 
 ### Capabilities that did not exist before
 

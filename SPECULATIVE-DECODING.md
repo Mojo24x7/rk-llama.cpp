@@ -216,3 +216,39 @@ correction changed the ranking.
   MTP head should win there, but the only dense hybrid we could test is
   bandwidth-bound at roughly 1.5 t/s for unrelated reasons, which makes it a
   poor vehicle.
+
+---
+
+## MTP (multi-token-prediction head) drafting — measured, and it loses
+
+Qwen3.6-35B-A3B ships a trained MTP head, and the modern tree supports it natively
+(`--spec-type draft-mtp -md <head> --spec-draft-n-max N`). It is the obvious
+candidate to beat prompt-lookup, because it drafts from the model itself and so
+works on any text rather than only where the output repeats the input.
+
+It does not. Distinct prompts with nothing to quote — neutral ground, which is the
+fair test of a head drafter's intrinsic value. Drift +3.2 %, corrected reference
+5.14 t/s:
+
+| config | decode | vs reference |
+|---|---|---|
+| `--spec-type none` | 5.06 / 5.22 | — |
+| `ngram-simple` (deployed) | 5.04 | **−2 %, i.e. free** |
+| `draft-mtp --spec-draft-n-max 1` | 4.73 | **−8.0 %** |
+| `draft-mtp --spec-draft-n-max 2` | 4.39 | **−14.6 %** |
+
+It loses on every prompt and **monotonically with draft width**, which is the
+mechanism showing itself: on a sparse MoE a batched verify activates the *union* of
+experts across the drafted positions, so each extra drafted token makes the target
+read more weight bytes, not fewer. A head drafter is structurally the wrong shape
+here.
+
+Two incidental findings. The MTP head loads against a *different* quantisation of
+the same model than the one it was built beside — matching vocabulary is
+sufficient. And `--spec-draft-n-max 2` is accepted even though the head declares
+`nextn_predict_layers = 1`; it simply performs worse.
+
+The corollary matters more than the negative result: **`ngram-simple` costs
+exactly nothing when it cannot fire** (5.04 vs 5.14 on prompts with no reusable
+text), while MTP costs 8 % unconditionally. That asymmetry is why prompt-lookup is
+the right default on this hardware.
