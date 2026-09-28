@@ -1756,6 +1756,10 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             if (!rknpu_is_weight_src(op->src[0])) return false;
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
+            // The compute path multiplies one 2-D weight slice; batched weights
+            // (e.g. MLA per-head attn_k_b/attn_v_b) would leave all but the
+            // first slice's output wrong, so keep them off the NPU.
+            if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
 
             // Searching for available hardware pipeline for this tensor
             const auto* pipeline = config.resolve_op_support(src0);
